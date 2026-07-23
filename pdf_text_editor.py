@@ -24,6 +24,20 @@ Instructions file format (first sheet):
 -- any numbers found in that cell are treated as 1-indexed page numbers
 to skip for that rule.
 
+Anything that is NOT part of the two tables above is ignored by design,
+so the spreadsheet can carry human-readable notes without confusing the
+parser. Concretely:
+    - Any row(s) above the "Replace from this" header row (e.g. a title,
+      or a "Guide for users" row explaining how to fill the sheet in) are
+      skipped, since scanning only starts once that exact header is found.
+    - Each table ends at its first fully blank row. Anything below that
+      blank row -- e.g. a closing reminder like "Before finalising, add a
+      visual check of the whole page..." -- is never read as data, even
+      if it's in the same column as the delete-phrase list above it.
+This means notes/instructions meant for a *person* filling in the sheet
+(or for whoever reviews the finished PDF) can sit right in the sheet
+without needing to be removed before uploading it.
+
 Usage:
     python pdf_text_editor.py INPUT.pdf INSTRUCTIONS.xlsx OUTPUT.pdf [--previews DIR]
 """
@@ -161,6 +175,67 @@ def extract_all_fonts(doc, workdir):
     return font_files
 
 
+def find_overlap_warnings(page, inserted_specs, cover_rects):
+    """Automated version of "add a visual check of the whole page (not
+    just the edited spot) to catch any unintended text overlaps".
+
+    inserted_specs: list of (x, y, text) tuples for text we just inserted
+    on this page.
+    cover_rects: the white-out boxes drawn on this page -- used to ignore
+    the old text we deliberately hid underneath them (that text is still
+    technically present/extractable, by design -- see the module
+    docstring -- so it would otherwise "overlap" its own replacement on
+    every single edit and drown out real warnings).
+
+    Re-reads the page's text after insertion and flags any case where one
+    of *our* inserted spans overlaps a bounding box of some other,
+    genuinely still-visible span on the page -- the exact failure pattern
+    that previously caused things like a stray leftover "-" bleeding into
+    replacement text. Returns a list of human-readable warning strings
+    (empty if nothing looks wrong).
+    """
+    spans = get_spans(page)
+    inserted_spans, other_spans = [], []
+    for span in spans:
+        ox, oy = span["origin"]
+        is_ours = any(
+            abs(ox - ix) < 1.0 and abs(oy - iy) < 1.0
+            for ix, iy, _ in inserted_specs
+        )
+        (inserted_spans if is_ours else other_spans).append(span)
+
+    warnings = []
+    for ins in inserted_spans:
+        ins_rect = fitz.Rect(ins["bbox"])
+        for other in other_spans:
+            other_rect = fitz.Rect(other["bbox"])
+            inter = ins_rect & other_rect
+            if inter.is_empty:
+                continue
+            inter_area = inter.width * inter.height
+            if inter_area < 1.0:
+                continue
+            # The old/other text can perfectly legitimately share space
+            # with our new text -- that's exactly what happens when we
+            # white-out old text and write new text in its place. Only
+            # the OVERLAPPING REGION itself needs to be painted over for
+            # this to be invisible in the final render; the rest of that
+            # other span (e.g. an untouched "Handle:" label before it)
+            # is irrelevant. So check coverage of the intersection, not
+            # of the whole other span.
+            covered = any(
+                (inter & cover).width * (inter & cover).height >= 0.9 * inter_area
+                for cover in cover_rects
+            )
+            if covered:
+                continue
+            warnings.append(
+                f"'{ins['text'].strip()}' may overlap "
+                f"'{other['text'].strip()}' -- check this page closely"
+            )
+    return warnings
+
+
 def resolve_font(span_font_name, font_files):
     """Return (fontname, fontfile_or_None) for insert_text()."""
     name = span_font_name or ""
@@ -191,6 +266,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     total_replaced = 0
     total_deleted = 0
     modified_pages = set()
+    overlap_warnings = {}  # page_num -> list of warning strings
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -268,6 +344,17 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             else:
                 page.insert_text((x, y), text, fontsize=size, fontname=fontkey, color=(0, 0, 0))
 
+        # Automated stand-in for a human eyeballing "the whole page, not
+        # just the edited spot": re-check the page we just edited for any
+        # inserted text unexpectedly overlapping something else.
+        if insert_jobs:
+            inserted_specs = [(x, y, text) for x, y, text, *_ in insert_jobs]
+            page_warnings = find_overlap_warnings(page, inserted_specs, cover_rects)
+            if page_warnings:
+                overlap_warnings[page_num] = page_warnings
+                for w in page_warnings:
+                    print(f"  [OVERLAP WARNING] page {page_num}: {w}", file=sys.stderr)
+
     doc.save(output_pdf)
 
     if preview_dir and modified_pages:
@@ -277,7 +364,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             preview_doc[pno - 1].get_pixmap(dpi=150).save(
                 os.path.join(preview_dir, f"page{pno}_preview.png"))
 
-    return total_replaced, total_deleted, sorted(modified_pages)
+    return total_replaced, total_deleted, sorted(modified_pages), overlap_warnings
 
 
 if __name__ == "__main__":
@@ -288,6 +375,14 @@ if __name__ == "__main__":
     parser.add_argument("--previews", default=None, help="Directory to save preview PNGs of modified pages")
     args = parser.parse_args()
 
-    replaced, deleted, pages = process(args.pdf, args.xlsx, args.output, args.previews)
+    replaced, deleted, pages, overlap_warnings = process(args.pdf, args.xlsx, args.output, args.previews)
     print(f"Replaced {replaced} instance(s), deleted {deleted} instance(s).")
     print(f"Modified pages: {pages}")
+    if overlap_warnings:
+        print("\n*** POSSIBLE TEXT OVERLAP DETECTED -- review these pages before use: ***")
+        for pno, warnings in overlap_warnings.items():
+            print(f"  Page {pno}:")
+            for w in warnings:
+                print(f"    - {w}")
+    else:
+        print("No overlap issues detected on the modified pages.")

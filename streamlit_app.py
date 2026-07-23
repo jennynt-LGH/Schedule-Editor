@@ -27,6 +27,19 @@ st.write(
     "original font, size, and position as closely as possible."
 )
 
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template_instructions.xlsx")
+
+if os.path.exists(TEMPLATE_PATH):
+    with open(TEMPLATE_PATH, "rb") as f:
+        template_bytes = f.read()
+    st.download_button(
+        "Download blank instructions template (.xlsx)",
+        data=template_bytes,
+        file_name="template_instructions.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.caption("Fill this in with your replace/delete rules, save it, then upload it below.")
+
 col1, col2 = st.columns(2)
 with col1:
     pdf_file = st.file_uploader("PDF file", type=["pdf"])
@@ -66,7 +79,7 @@ if process_clicked:
 
         try:
             with st.spinner("Processing..."):
-                replaced, deleted, pages = process(
+                replaced, deleted, pages, overlap_warnings = process(
                     pdf_path, xlsx_path, output_path, preview_dir
                 )
         except Exception as e:
@@ -87,6 +100,16 @@ if process_clicked:
                 file_name=out_name,
                 mime="application/pdf",
             )
+
+            if overlap_warnings:
+                st.warning(
+                    "The tool ran its own check of the whole page (not just "
+                    "the edited spot) and found something that may need a "
+                    "closer look before you use this file:"
+                )
+                for pno, page_warnings in overlap_warnings.items():
+                    for w in page_warnings:
+                        st.write(f"- Page {pno}: {w}")
 
             if pages:
                 st.subheader("Preview of changed pages")
