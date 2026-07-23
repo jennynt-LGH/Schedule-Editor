@@ -1,0 +1,56 @@
+name: Process PDF
+
+# Runs automatically whenever files are added/changed inside the input/ folder.
+on:
+  push:
+    paths:
+      - "input/**"
+  workflow_dispatch: {}   # also lets you click "Run workflow" manually on the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Find input files
+        id: find
+        run: |
+          PDF_FILE=$(find input -iname "*.pdf" | head -n 1)
+          XLSX_FILE=$(find input -iname "*.xlsx" | head -n 1)
+          if [ -z "$PDF_FILE" ] || [ -z "$XLSX_FILE" ]; then
+            echo "::error::Couldn't find both a .pdf and a .xlsx file inside the input/ folder."
+            exit 1
+          fi
+          echo "pdf=$PDF_FILE" >> "$GITHUB_OUTPUT"
+          echo "xlsx=$XLSX_FILE" >> "$GITHUB_OUTPUT"
+          echo "base=$(basename "$PDF_FILE" .pdf)" >> "$GITHUB_OUTPUT"
+
+      - name: Run PDF text editor
+        run: |
+          mkdir -p output
+          python pdf_text_editor.py \
+            "${{ steps.find.outputs.pdf }}" \
+            "${{ steps.find.outputs.xlsx }}" \
+            "output/${{ steps.find.outputs.base }}_updated.pdf" \
+            --previews "output/${{ steps.find.outputs.base }}_previews"
+
+      - name: Commit results back to the repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git diff --cached --quiet || git commit -m "Auto-process PDF from input/"
+          git push
