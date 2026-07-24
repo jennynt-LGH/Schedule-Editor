@@ -67,6 +67,17 @@ it, followed by one phrase per row to remove entirely.
 
 Leave a blank row to end each table (see the example file).
 
+**Notes and guide text are safe to leave in the sheet.** The tool only
+starts reading once it finds the exact header row (`Replace from this`),
+and each table stops at its first blank row — so anything above the
+header (a title, a "how to fill this in" guide row) or below that
+closing blank row (a reminder note, etc.) is simply ignored, never read
+as data. That's why the template has a guide row and a closing reminder
+in it and still works.
+
+If you're using the web app, there's a "Download blank instructions
+template" button that gives you this same file to fill in.
+
 ## Good to know / limitations
 
 - **This covers text, it doesn't erase it.** The tool draws a white box
