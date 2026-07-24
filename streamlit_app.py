@@ -103,9 +103,9 @@ if process_clicked:
 
             if not_found_warnings:
                 st.warning(
-                    "One or more rows in your instructions file didn't "
-                    "match anything in this PDF, so nothing happened for "
-                    "them:"
+                    "Some of your instructions may need a closer look -- "
+                    "either they didn't match anything, or they matched "
+                    "some but missed a similar-looking variant:"
                 )
                 for w in not_found_warnings:
                     st.write(f"- {w}")

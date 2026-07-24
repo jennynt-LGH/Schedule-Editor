@@ -316,6 +316,35 @@ def font_covers_text(fontkey, fontfile, text):
     return True
 
 
+def find_near_miss_texts(spans, old):
+    """A replace rule only matches text that is EXACTLY the same as `old`.
+    If the PDF has a slightly different version of that text nearby (an
+    extra word, a typo, different spacing -- e.g. the rule says "Aluclad
+    Timber 68 PEFC Jointed Pine" but this page actually says "Aluclad
+    Timber 68x80 PEFC Jointed Pine"), the rule silently skips it with no
+    error at all, which is easy to miss.
+
+    `old` is usually only PART of a span's text (e.g. it sits after a
+    "System: " label), so we can't assume it starts at position 0 of the
+    span. Instead: take a long leading chunk of `old` and check whether
+    that chunk shows up anywhere inside a span's text that ISN'T an exact
+    match -- a strong sign a near-duplicate slipped through. Returns the
+    list of distinct near-miss texts found.
+    """
+    chunk_len = max(10, int(len(old) * 0.4))
+    chunk = old[:chunk_len].lower()
+    seen = set()
+    variants = []
+    for span in spans:
+        text = span["text"].strip()
+        if not text or old in text:
+            continue
+        if chunk in text.lower() and text not in seen:
+            seen.add(text)
+            variants.append(text)
+    return variants
+
+
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
@@ -335,6 +364,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     replace_hit_counts = [0] * len(replace_rules)
     delete_hit_counts = [0] * len(delete_phrases)
     delete_resolved = [parse_delete_phrase(p) for p in delete_phrases]
+    near_miss = {}  # rule_idx -> {variant_text: set(page_num, ...)}
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -391,6 +421,9 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 insert_jobs.append((rect.x0, baseline_y, combined_text, fontkey, fontfile, size))
                 total_replaced += 1
                 modified_pages.add(page_num)
+
+            for variant_text in find_near_miss_texts(spans, old):
+                near_miss.setdefault(rule_idx, {}).setdefault(variant_text, set()).add(page_num)
 
         for phrase_idx, phrase in enumerate(delete_phrases):
             search_text, whole_line = delete_resolved[phrase_idx]
@@ -470,6 +503,16 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 f"found anywhere in the PDF (outside any exception pages) -- "
                 f"double-check the spelling/spacing matches the PDF exactly."
             )
+        variants = near_miss.get(rule_idx)
+        if variants:
+            for variant_text, pgs in variants.items():
+                not_found_warnings.append(
+                    f"Your rule '{rule['old']}' -> '{rule['new']}' left "
+                    f"\"{variant_text}\" unchanged on page(s) {sorted(pgs)} "
+                    f"-- it's close to your rule's text but not identical, "
+                    f"so it didn't match. Add a separate row with this exact "
+                    f"wording if it should change too."
+                )
     for phrase_idx, phrase in enumerate(delete_phrases):
         if delete_hit_counts[phrase_idx] == 0:
             search_text, whole_line = delete_resolved[phrase_idx]
