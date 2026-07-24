@@ -17,8 +17,16 @@ Instructions file format (first sheet):
     Table 2 (a row containing "Delete these words from PDF" starts it):
         <word or phrase to delete>
         <word or phrase to delete>
+        the whole line of "<some text on that line>"
         ...
         (a blank row ends the table)
+
+A delete row can either be:
+    - a literal word/phrase that appears in the PDF -- only that text is
+      removed, or
+    - "the whole line of "<text>"" -- finds <text> in the PDF, then
+      removes the ENTIRE line it's on (useful for removing a whole
+      "U-value (W/m2K)= 1.39" style line by only naming part of it).
 
 "Exception" may be blank, "-", or something like "page 9" / "pages 3, 5"
 -- any numbers found in that cell are treated as 1-indexed page numbers
@@ -133,9 +141,39 @@ def get_spans(page):
     d = page.get_text("dict")
     for block in d["blocks"]:
         for line in block.get("lines", []):
+            line_bbox = line["bbox"]
             for span in line["spans"]:
+                span = dict(span)
+                span["line_bbox"] = line_bbox
                 spans.append(span)
     return spans
+
+
+_WHOLE_LINE_RE = re.compile(r"whole line(?:s)?\s+of\b\s*(.*)", re.IGNORECASE)
+
+
+def parse_delete_phrase(raw):
+    """A "delete" row is normally a literal phrase to remove. But it can
+    also be written as an instruction FOR A PERSON describing what to
+    remove, e.g. 'the whole line of "U-value (W/m2K)"' -- that sentence
+    itself will never appear in the PDF, so searching for it literally
+    would silently find and delete nothing.
+
+    Detect that pattern and return (search_text, whole_line) where
+    search_text is the actual text to locate on the page, and whole_line
+    means: once found, remove the ENTIRE line it's on (not just the
+    matched substring). Anything that doesn't match the pattern is
+    treated as a plain literal phrase, unchanged from before.
+    """
+    s = raw.strip()
+    m = _WHOLE_LINE_RE.search(s)
+    if m:
+        inner = m.group(1).strip()
+        inner = inner.strip("\"'“”‘’").strip()
+        inner = inner.rstrip(".").strip()
+        if inner:
+            return inner, True
+    return s, False
 
 
 def find_containing_span(spans, rect):
@@ -236,6 +274,19 @@ def find_overlap_warnings(page, inserted_specs, cover_rects):
     return warnings
 
 
+def _base14_for_style(name):
+    """Pick a built-in base-14 font (full standard glyph coverage) that
+    matches the bold/italic style implied by an original font's name."""
+    lname = (name or "").lower()
+    if "bold" in lname and ("italic" in lname or "oblique" in lname):
+        return "hebi"
+    if "bold" in lname:
+        return "hebo"
+    if "italic" in lname or "oblique" in lname:
+        return "heit"
+    return "helv"
+
+
 def resolve_font(span_font_name, font_files):
     """Return (fontname, fontfile_or_None) for insert_text()."""
     name = span_font_name or ""
@@ -243,14 +294,26 @@ def resolve_font(span_font_name, font_files):
         name = name.split("+", 1)[1]
     if name in font_files:
         return name, font_files[name]
-    lname = name.lower()
-    if "bold" in lname and ("italic" in lname or "oblique" in lname):
-        return "hebi", None
-    if "bold" in lname:
-        return "hebo", None
-    if "italic" in lname or "oblique" in lname:
-        return "heit", None
-    return "helv", None
+    return _base14_for_style(name), None
+
+
+def font_covers_text(fontkey, fontfile, text):
+    """PDFs typically only embed the exact glyphs the original document
+    used. A replacement/inserted phrase can easily need a character the
+    original never did (e.g. a digit, an accent, a punctuation mark) --
+    inserting with a font missing that glyph renders as a blank box
+    ("tofu") instead of the character. Check every non-space character in
+    `text` actually exists in the chosen font before using it."""
+    try:
+        font_obj = fitz.Font(fontfile=fontfile) if fontfile else fitz.Font(fontkey)
+    except Exception:
+        return False
+    for ch in text:
+        if ch.isspace():
+            continue
+        if not font_obj.has_glyph(ord(ch)):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +330,11 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     total_deleted = 0
     modified_pages = set()
     overlap_warnings = {}  # page_num -> list of warning strings
+    not_found_warnings = []  # human-readable strings about rules that matched nothing
+
+    replace_hit_counts = [0] * len(replace_rules)
+    delete_hit_counts = [0] * len(delete_phrases)
+    delete_resolved = [parse_delete_phrase(p) for p in delete_phrases]
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -276,11 +344,12 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         cover_rects = []
         insert_jobs = []  # (x, y, text, fontname, fontfile_or_None, size)
 
-        for rule in replace_rules:
+        for rule_idx, rule in enumerate(replace_rules):
             old, new = rule["old"], rule["new"]
             if not old or page_num in rule["exception_pages"]:
                 continue
             for rect in page.search_for(old):
+                replace_hit_counts[rule_idx] += 1
                 span = find_containing_span(spans, rect)
                 pad = 0.4
                 if span is None:
@@ -299,21 +368,48 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                     idx = span["text"].find(old)
                     suffix = span["text"][idx + len(old):] if idx != -1 else ""
 
+                combined_text = new + suffix
+
+                # The document's embedded font is usually a SUBSET containing
+                # only the glyphs the original file actually used. If the
+                # replacement text needs a character that subset doesn't have
+                # (a digit, an accent, a symbol...), using it anyway would
+                # render as a blank box. Fall back to a full-coverage builtin
+                # font (matching the same bold/italic style) in that case.
+                if not font_covers_text(fontkey, fontfile, combined_text):
+                    fallback_key = _base14_for_style(fontkey)
+                    print(f"  [warn] page {page_num}: font '{fontkey}' is missing a "
+                          f"character needed for '{combined_text}' -- falling back to "
+                          f"a built-in font", file=sys.stderr)
+                    fontkey, fontfile = fallback_key, None
+
                 # Cover from the start of the old text through to the end of
                 # its span (so any trailing text sharing the same span, e.g.
                 # "OTHER - 3 quantity:", gets reflowed after the new text
                 # instead of being overlapped by it).
                 cover_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, span_x1 + pad, rect.y1 + pad))
-                insert_jobs.append((rect.x0, baseline_y, new + suffix, fontkey, fontfile, size))
+                insert_jobs.append((rect.x0, baseline_y, combined_text, fontkey, fontfile, size))
                 total_replaced += 1
                 modified_pages.add(page_num)
 
-        for phrase in delete_phrases:
-            for rect in page.search_for(phrase):
+        for phrase_idx, phrase in enumerate(delete_phrases):
+            search_text, whole_line = delete_resolved[phrase_idx]
+            for rect in page.search_for(search_text):
+                delete_hit_counts[phrase_idx] += 1
                 span = find_containing_span(spans, rect)
                 pad = 0.4
+                if whole_line and span is not None:
+                    # The instruction said to remove the entire line this
+                    # text lives on, not just the matched words -- e.g.
+                    # "the whole line of 'U-value (W/m2K)'" means delete
+                    # the whole "U-value (W/m2K)= 1.39" line.
+                    lx0, ly0, lx1, ly1 = span.get("line_bbox", span["bbox"])
+                    cover_rects.append(fitz.Rect(lx0 - pad, ly0 - pad, lx1 + pad, ly1 + pad))
+                    total_deleted += 1
+                    modified_pages.add(page_num)
+                    continue
                 if span is not None:
-                    remainder = span["text"].replace(phrase, "", 1)
+                    remainder = span["text"].replace(search_text, "", 1)
                     if remainder.strip(" \t-:") == "":
                         # The whole span is essentially just this phrase
                         # (plus separators like " - ") -- remove all of it
@@ -364,7 +460,26 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             preview_doc[pno - 1].get_pixmap(dpi=150).save(
                 os.path.join(preview_dir, f"page{pno}_preview.png"))
 
-    return total_replaced, total_deleted, sorted(modified_pages), overlap_warnings
+    # Flag any rule/phrase that never matched anywhere in the document --
+    # almost always a typo, extra space, or the PDF wording being slightly
+    # different from what was typed into the spreadsheet.
+    for rule_idx, rule in enumerate(replace_rules):
+        if replace_hit_counts[rule_idx] == 0:
+            not_found_warnings.append(
+                f"Replace rule '{rule['old']}' -> '{rule['new']}' was not "
+                f"found anywhere in the PDF (outside any exception pages) -- "
+                f"double-check the spelling/spacing matches the PDF exactly."
+            )
+    for phrase_idx, phrase in enumerate(delete_phrases):
+        if delete_hit_counts[phrase_idx] == 0:
+            search_text, whole_line = delete_resolved[phrase_idx]
+            not_found_warnings.append(
+                f"Delete instruction '{phrase}' (looking for \"{search_text}\") "
+                f"was not found anywhere in the PDF -- double-check the "
+                f"spelling/spacing matches the PDF exactly."
+            )
+
+    return total_replaced, total_deleted, sorted(modified_pages), overlap_warnings, not_found_warnings
 
 
 if __name__ == "__main__":
@@ -375,7 +490,9 @@ if __name__ == "__main__":
     parser.add_argument("--previews", default=None, help="Directory to save preview PNGs of modified pages")
     args = parser.parse_args()
 
-    replaced, deleted, pages, overlap_warnings = process(args.pdf, args.xlsx, args.output, args.previews)
+    replaced, deleted, pages, overlap_warnings, not_found_warnings = process(
+        args.pdf, args.xlsx, args.output, args.previews
+    )
     print(f"Replaced {replaced} instance(s), deleted {deleted} instance(s).")
     print(f"Modified pages: {pages}")
     if overlap_warnings:
@@ -386,3 +503,7 @@ if __name__ == "__main__":
                 print(f"    - {w}")
     else:
         print("No overlap issues detected on the modified pages.")
+    if not_found_warnings:
+        print("\n*** SOME RULES DID NOT MATCH ANYTHING -- check these: ***")
+        for w in not_found_warnings:
+            print(f"  - {w}")

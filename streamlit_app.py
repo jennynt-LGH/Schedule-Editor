@@ -79,7 +79,7 @@ if process_clicked:
 
         try:
             with st.spinner("Processing..."):
-                replaced, deleted, pages, overlap_warnings = process(
+                replaced, deleted, pages, overlap_warnings, not_found_warnings = process(
                     pdf_path, xlsx_path, output_path, preview_dir
                 )
         except Exception as e:
@@ -100,6 +100,15 @@ if process_clicked:
                 file_name=out_name,
                 mime="application/pdf",
             )
+
+            if not_found_warnings:
+                st.warning(
+                    "One or more rows in your instructions file didn't "
+                    "match anything in this PDF, so nothing happened for "
+                    "them:"
+                )
+                for w in not_found_warnings:
+                    st.write(f"- {w}")
 
             if overlap_warnings:
                 st.warning(
