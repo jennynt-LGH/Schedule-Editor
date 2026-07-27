@@ -51,19 +51,35 @@ It has two sections on the first sheet:
 
 **Replace table** — a row with the header `Replace from this` starts it:
 
-| Replace from this | to this | Exception | Font size of new text |
-|---|---|---|---|
-| old phrase | new phrase | page 9 | 12.08 |
+| Replace from this | to this | Only here | Skip this (don't apply to these) | Font size of new text |
+|---|---|---|---|---|
+| old phrase | new phrase | Pos no. 12 | page 9 | 12.08 |
 
-- `Exception` can be blank, `-`, or something like `page 9` — any page
-  numbers mentioned there are skipped for that rule.
+- `Only here` and `Skip this (don't apply to these)` can each be blank,
+  `-`, a page reference (`page 9`, `pages 3, 5`), or a POS number
+  reference (`Pos no. 12`, `POS #3, 7`) — a POS number is the "Pos.no N:"
+  label the PDF itself prints next to each item, not a spreadsheet row.
+  Whether a cell means pages or POS numbers is just decided by whether
+  the word "pos" appears in it anywhere.
+  - `Only here` restricts the rule to ONLY the listed page(s)/POS
+    number(s), skipping every other occurrence in the document.
+  - `Skip this (don't apply to these)` does the opposite — the rule
+    applies everywhere EXCEPT the listed page(s)/POS number(s). (Older
+    sheets may call this column "Exception" or "Except for this" —
+    all these headers are recognized.)
 - `Font size of new text` is the point size to use for the replacement.
 - The new text automatically matches the original's font and style
   (regular / bold / italic) and lines up in the same spot — you don't
   need to specify that separately.
 
 **Delete table** — a row containing `Delete these words from PDF` starts
-it, followed by one phrase per row to remove entirely.
+it, followed by one phrase per row to remove entirely. It can optionally
+have the same `Only here` / `Skip this (don't apply to these)` columns as
+the replace table, working exactly the same way, per delete row.
+
+A delete row's phrase can also be written as `the whole line of "some
+text"` — this finds that text and removes the ENTIRE line it's on,
+useful for removing a whole spec line by only naming part of it.
 
 Leave a blank row to end each table (see the example file).
 
@@ -96,3 +112,12 @@ template" button that gives you this same file to fill in.
   font (rare), it'll fall back to a plain font at a best-guess size and
   print a warning in the Actions log — worth a closer look at the preview
   in that case.
+- If the replacement text needs a character the PDF's own font doesn't
+  have (e.g. a digit, in a font subset that only ever had letters), the
+  tool automatically switches to a safe backup font instead of leaving a
+  blank box.
+- After processing, the tool checks its own work and tells you about
+  anything that looks off: a row that didn't match anything at all, a
+  row that matched some copies of a phrase but left a slightly different
+  variant unchanged elsewhere, or an inserted edit that ended up
+  overlapping other text. Worth reading before you send the file on.

@@ -9,28 +9,41 @@ original font style, size, and position.
 Instructions file format (first sheet):
 
     Table 1 (a row containing the header "Replace from this" starts it):
-        Replace from this | to this | Exception | Font size of new text | (anything else, ignored)
-        <old text>         | <new>   | page 9    | 12.08
+        Replace from this | to this | Only here | Skip this (don't apply to these) | Font size of new text | (anything else, ignored)
+        <old text>         | <new>   | Pos no. 12 | page 9          | 12.08
         ...
         (a blank row ends the table)
 
-    Table 2 (a row containing "Delete these words from PDF" starts it):
-        <word or phrase to delete>
-        <word or phrase to delete>
-        the whole line of "<some text on that line>"
+    Table 2 (a row containing "Delete these words from PDF" starts it),
+    which optionally takes the SAME "Only here" / "Skip this" columns:
+        Delete these words from PDF | Only here | Skip this (don't apply to these)
+        <word or phrase to delete>   | Pos no. 3  |
+        the whole line of "<text>"   |            | page 9
         ...
         (a blank row ends the table)
 
-A delete row can either be:
+A delete row's phrase can either be:
     - a literal word/phrase that appears in the PDF -- only that text is
       removed, or
     - "the whole line of "<text>"" -- finds <text> in the PDF, then
       removes the ENTIRE line it's on (useful for removing a whole
       "U-value (W/m2K)= 1.39" style line by only naming part of it).
 
-"Exception" may be blank, "-", or something like "page 9" / "pages 3, 5"
--- any numbers found in that cell are treated as 1-indexed page numbers
-to skip for that rule.
+"Only here" and "Skip this (don't apply to these)" both accept the same
+kind of value in either table: blank, "-", a page number/numbers ("page
+9", "pages 3, 5"), or a POS number/numbers ("Pos no. 12", "POS #3, 7").
+Whether a cell means pages or POS numbers is decided by whether the word
+"pos" appears in it anywhere (any spacing/punctuation/case: "POS 12",
+"pos.no 12", "POS #12" all count) -- otherwise the numbers in it are
+treated as page numbers.
+    - "Only here": the rule applies ONLY at the listed page(s)/POS
+      number(s), and is skipped everywhere else in the document.
+    - "Skip this (don't apply to these)": the rule applies everywhere
+      EXCEPT the listed page(s)/POS number(s) (this column has also been
+      called "Exception" / "Except for this" in older sheets -- all three
+      headers are recognized).
+A POS number refers to the "Pos.no N:" label the PDF itself prints next
+to each item -- not a spreadsheet row number.
 
 Anything that is NOT part of the two tables above is ignored by design,
 so the spreadsheet can carry human-readable notes without confusing the
@@ -68,6 +81,29 @@ def _norm(cell):
     return str(cell).strip().lower() if cell is not None else ""
 
 
+def _parse_location_cell(raw):
+    """Parse an "Only here" / "Except for this" style cell. Returns
+    (pages, pos_numbers) -- a pair of sets of ints, at most one non-empty.
+
+    Accepts blank, "-", a page reference ("page 9", "pages 3, 5"), or a
+    POS-number reference ("Pos no. 12", "POS #3, 7"). Whether it's pages
+    or POS numbers is decided by whether "pos" appears anywhere in the
+    cell (case-insensitive, any spacing/punctuation); otherwise any
+    numbers found are treated as page numbers.
+    """
+    if raw is None:
+        return set(), set()
+    s = str(raw).strip()
+    if s == "" or s == "-":
+        return set(), set()
+    nums = {int(x) for x in re.findall(r"\d+", s)}
+    if not nums:
+        return set(), set()
+    if "pos" in s.lower():
+        return set(), nums
+    return nums, set()
+
+
 def parse_instructions(xlsx_path):
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     ws = wb.worksheets[0]
@@ -84,8 +120,17 @@ def parse_instructions(xlsx_path):
         if any("replace from this" in c for c in norm_row):
             col_from = next(j for j, c in enumerate(norm_row) if "replace from this" in c)
             col_to = next((j for j, c in enumerate(norm_row) if "to this" in c), col_from + 1)
-            col_exc = next((j for j, c in enumerate(norm_row) if "exception" in c), col_from + 2)
-            col_size = next((j for j, c in enumerate(norm_row) if "font size" in c), col_from + 3)
+            # "Only here" is the newer inclusion column; older sheets won't
+            # have it at all, so col_only can legitimately stay None.
+            col_only = next((j for j, c in enumerate(norm_row) if "only" in c), None)
+            # "except"/"skip" covers all the header wordings seen so far:
+            # the original "Exception", and the newer "Except for this" /
+            # "Skip this (don't apply to these)".
+            col_exc = next(
+                (j for j, c in enumerate(norm_row) if "except" in c or "skip" in c),
+                (col_only + 1) if col_only is not None else col_from + 2,
+            )
+            col_size = next((j for j, c in enumerate(norm_row) if "font size" in c), col_exc + 1)
             i += 1
             while i < n:
                 r = rows[i]
@@ -93,12 +138,12 @@ def parse_instructions(xlsx_path):
                 if old is None or str(old).strip() == "":
                     break
                 new = r[col_to] if col_to < len(r) else None
+                only_raw = r[col_only] if (col_only is not None and col_only < len(r)) else None
                 exc_raw = r[col_exc] if col_exc < len(r) else None
                 size_raw = r[col_size] if col_size < len(r) else None
 
-                exception_pages = set()
-                if exc_raw is not None and str(exc_raw).strip() not in ("", "-"):
-                    exception_pages = {int(x) for x in re.findall(r"\d+", str(exc_raw))}
+                only_pages, only_pos = _parse_location_cell(only_raw)
+                except_pages, except_pos = _parse_location_cell(exc_raw)
 
                 size = None
                 try:
@@ -110,20 +155,36 @@ def parse_instructions(xlsx_path):
                 replace_rules.append({
                     "old": str(old).strip(),
                     "new": "" if new is None else str(new).strip(),
-                    "exception_pages": exception_pages,
+                    "only_pages": only_pages,
+                    "only_pos": only_pos,
+                    "except_pages": except_pages,
+                    "except_pos": except_pos,
                     "size": size,
                 })
                 i += 1
             continue
 
         if any("delete these words" in c for c in norm_row):
+            col_phrase = next(j for j, c in enumerate(norm_row) if "delete these words" in c)
+            col_only = next((j for j, c in enumerate(norm_row) if "only" in c), None)
+            col_skip = next((j for j, c in enumerate(norm_row) if "except" in c or "skip" in c), None)
             i += 1
             while i < n:
                 r = rows[i]
-                vals = [c for c in r if c is not None and str(c).strip() != ""]
-                if not vals:
+                phrase = r[col_phrase] if col_phrase < len(r) else None
+                if phrase is None or str(phrase).strip() == "":
                     break
-                delete_phrases.append(str(vals[0]).strip())
+                only_raw = r[col_only] if (col_only is not None and col_only < len(r)) else None
+                skip_raw = r[col_skip] if (col_skip is not None and col_skip < len(r)) else None
+                only_pages, only_pos = _parse_location_cell(only_raw)
+                except_pages, except_pos = _parse_location_cell(skip_raw)
+                delete_phrases.append({
+                    "phrase": str(phrase).strip(),
+                    "only_pages": only_pages,
+                    "only_pos": only_pos,
+                    "except_pages": except_pages,
+                    "except_pos": except_pos,
+                })
                 i += 1
             continue
 
@@ -147,6 +208,41 @@ def get_spans(page):
                 span["line_bbox"] = line_bbox
                 spans.append(span)
     return spans
+
+
+_POS_LABEL_RE = re.compile(r"pos\.?\s*no\.?\s*(\d+)", re.IGNORECASE)
+
+
+def build_pos_blocks(spans, page_bottom):
+    """Each item in the schedule PDF is introduced by a "Pos.no N:" label.
+    This finds every such label on the page and works out the vertical
+    range of the page that belongs to each one (from its own label down
+    to the start of the next one, or the bottom of the page for the last
+    item) -- so a match's y-position can be mapped back to "which POS
+    number is this text part of". Returns a list of (y_start, y_end,
+    pos_number) tuples.
+    """
+    labels = []
+    for span in spans:
+        m = _POS_LABEL_RE.search(span["text"])
+        if m:
+            labels.append((span["bbox"][1], int(m.group(1))))
+    labels.sort(key=lambda t: t[0])
+    blocks = []
+    for idx, (y0, pos_num) in enumerate(labels):
+        y_end = labels[idx + 1][0] if idx + 1 < len(labels) else page_bottom
+        blocks.append((y0, y_end, pos_num))
+    return blocks
+
+
+def pos_number_for_rect(pos_blocks, rect):
+    """Which POS number's block a given match rectangle falls into, or
+    None if the page has no recognizable "Pos.no N:" labels at all."""
+    cy = (rect.y0 + rect.y1) / 2
+    for y_start, y_end, pos_num in pos_blocks:
+        if y_start <= cy < y_end:
+            return pos_num
+    return None
 
 
 _WHOLE_LINE_RE = re.compile(r"whole line(?:s)?\s+of\b\s*(.*)", re.IGNORECASE)
@@ -361,25 +457,48 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     overlap_warnings = {}  # page_num -> list of warning strings
     not_found_warnings = []  # human-readable strings about rules that matched nothing
 
-    replace_hit_counts = [0] * len(replace_rules)
-    delete_hit_counts = [0] * len(delete_phrases)
-    delete_resolved = [parse_delete_phrase(p) for p in delete_phrases]
+    # raw_hit_counts: every time a rule's "old" text was found on a page
+    # this rule wasn't entirely gated out of (used to tell "genuinely not
+    # found anywhere" apart from "found, but Only/Except correctly
+    # restricted it away").
+    raw_hit_counts = [0] * len(replace_rules)
+    applied_hit_counts = [0] * len(replace_rules)
+    raw_delete_hit_counts = [0] * len(delete_phrases)
+    delete_resolved = [parse_delete_phrase(p["phrase"]) for p in delete_phrases]
     near_miss = {}  # rule_idx -> {variant_text: set(page_num, ...)}
 
     for pno in range(len(doc)):
         page = doc[pno]
         page_num = pno + 1
         spans = get_spans(page)
+        pos_blocks = build_pos_blocks(spans, page.rect.y1)
 
         cover_rects = []
         insert_jobs = []  # (x, y, text, fontname, fontfile_or_None, size)
 
         for rule_idx, rule in enumerate(replace_rules):
             old, new = rule["old"], rule["new"]
-            if not old or page_num in rule["exception_pages"]:
+            if not old:
+                continue
+            # Page-level gates -- these can be decided before even
+            # searching the page, since they're page-number-based.
+            if rule["except_pages"] and page_num in rule["except_pages"]:
+                continue
+            if rule["only_pages"] and page_num not in rule["only_pages"]:
                 continue
             for rect in page.search_for(old):
-                replace_hit_counts[rule_idx] += 1
+                raw_hit_counts[rule_idx] += 1
+
+                # POS-number-based gates -- these need the actual match
+                # location, since a single page can hold several POS items.
+                if rule["only_pos"] or rule["except_pos"]:
+                    pos_num = pos_number_for_rect(pos_blocks, rect)
+                    if rule["only_pos"] and pos_num not in rule["only_pos"]:
+                        continue
+                    if rule["except_pos"] and pos_num in rule["except_pos"]:
+                        continue
+
+                applied_hit_counts[rule_idx] += 1
                 span = find_containing_span(spans, rect)
                 pad = 0.4
                 if span is None:
@@ -425,10 +544,22 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             for variant_text in find_near_miss_texts(spans, old):
                 near_miss.setdefault(rule_idx, {}).setdefault(variant_text, set()).add(page_num)
 
-        for phrase_idx, phrase in enumerate(delete_phrases):
+        for phrase_idx, phrase_rule in enumerate(delete_phrases):
+            if phrase_rule["except_pages"] and page_num in phrase_rule["except_pages"]:
+                continue
+            if phrase_rule["only_pages"] and page_num not in phrase_rule["only_pages"]:
+                continue
             search_text, whole_line = delete_resolved[phrase_idx]
             for rect in page.search_for(search_text):
-                delete_hit_counts[phrase_idx] += 1
+                raw_delete_hit_counts[phrase_idx] += 1
+
+                if phrase_rule["only_pos"] or phrase_rule["except_pos"]:
+                    pos_num = pos_number_for_rect(pos_blocks, rect)
+                    if phrase_rule["only_pos"] and pos_num not in phrase_rule["only_pos"]:
+                        continue
+                    if phrase_rule["except_pos"] and pos_num in phrase_rule["except_pos"]:
+                        continue
+
                 span = find_containing_span(spans, rect)
                 pad = 0.4
                 if whole_line and span is not None:
@@ -495,12 +626,16 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
 
     # Flag any rule/phrase that never matched anywhere in the document --
     # almost always a typo, extra space, or the PDF wording being slightly
-    # different from what was typed into the spreadsheet.
+    # different from what was typed into the spreadsheet. Note this uses
+    # raw_hit_counts (found at all, before Only/Except filtering) rather
+    # than applied_hit_counts, so a rule correctly restricted down to zero
+    # actual edits by its own Only/Except settings does NOT get flagged --
+    # that's the sheet working as intended, not a mistake.
     for rule_idx, rule in enumerate(replace_rules):
-        if replace_hit_counts[rule_idx] == 0:
+        if raw_hit_counts[rule_idx] == 0:
             not_found_warnings.append(
                 f"Replace rule '{rule['old']}' -> '{rule['new']}' was not "
-                f"found anywhere in the PDF (outside any exception pages) -- "
+                f"found anywhere in the PDF (outside any Only/Except pages) -- "
                 f"double-check the spelling/spacing matches the PDF exactly."
             )
         variants = near_miss.get(rule_idx)
@@ -513,12 +648,13 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                     f"so it didn't match. Add a separate row with this exact "
                     f"wording if it should change too."
                 )
-    for phrase_idx, phrase in enumerate(delete_phrases):
-        if delete_hit_counts[phrase_idx] == 0:
+    for phrase_idx, phrase_rule in enumerate(delete_phrases):
+        if raw_delete_hit_counts[phrase_idx] == 0:
             search_text, whole_line = delete_resolved[phrase_idx]
             not_found_warnings.append(
-                f"Delete instruction '{phrase}' (looking for \"{search_text}\") "
-                f"was not found anywhere in the PDF -- double-check the "
+                f"Delete instruction '{phrase_rule['phrase']}' (looking for "
+                f"\"{search_text}\") was not found anywhere in the PDF "
+                f"(outside any Only/Except pages) -- double-check the "
                 f"spelling/spacing matches the PDF exactly."
             )
 

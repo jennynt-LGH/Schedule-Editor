@@ -50,11 +50,19 @@ with st.expander("What should the instructions spreadsheet look like?"):
     st.write(
         "First sheet, two sections:\n\n"
         "**Replace table** -- a row containing the header `Replace from "
-        "this` starts it, with columns for `to this`, `Exception` "
-        "(e.g. `page 9`, or `-`/blank for none), and `Font size of new "
+        "this` starts it, with columns for `to this`, `Only here`, "
+        "`Skip this (don't apply to these)`, and `Font size of new "
         "text`.\n\n"
         "**Delete table** -- a row containing `Delete these words from "
-        "PDF` starts it, followed by one phrase per row to remove.\n\n"
+        "PDF` starts it, followed by one phrase per row to remove. It can "
+        "optionally have the same `Only here` / `Skip this` columns too.\n\n"
+        "`Only here` / `Skip this` can each be blank, `-`, a page "
+        "reference (`page 9`, `pages 3, 5`), or a POS number reference "
+        "(`Pos no. 12`) -- `Only here` restricts a rule to just that "
+        "page/POS number, `Skip this` applies the rule everywhere except "
+        "it.\n\n"
+        "A delete row can also be written as `the whole line of "
+        "\"some text\"` to remove the entire line it's on.\n\n"
         "A blank row ends each table."
     )
 
