@@ -81,22 +81,56 @@ def _norm(cell):
     return str(cell).strip().lower() if cell is not None else ""
 
 
+def _expand_range_tokens(s):
+    """Turn a comma-separated cell of numbers/ranges into a set of ints.
+
+    Each comma-separated chunk is either a single number ("9") or a range
+    ("3-7"). A chunk counts as a range whenever it contains a "-" AND at
+    least two numbers -- so "POS 1-8", "1-3", "POS 1-POS 6", and "6-POS 9"
+    all resolve the same way (only the digits and the dash matter; any
+    words like "POS" in between are ignored). A lone number, or a chunk
+    with a dash but only one number in it (e.g. a stray trailing "-"), is
+    treated as a single value rather than a range. Whichever of the two
+    numbers is larger becomes the range's end, so "8-3" behaves the same
+    as "3-8".
+    """
+    nums = set()
+    for chunk in s.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = re.findall(r"\d+", chunk)
+        if not parts:
+            continue
+        if "-" in chunk and len(parts) >= 2:
+            start, end = int(parts[0]), int(parts[-1])
+            if start > end:
+                start, end = end, start
+            nums.update(range(start, end + 1))
+        else:
+            nums.update(int(p) for p in parts)
+    return nums
+
+
 def _parse_location_cell(raw):
     """Parse an "Only here" / "Except for this" style cell. Returns
     (pages, pos_numbers) -- a pair of sets of ints, at most one non-empty.
 
-    Accepts blank, "-", a page reference ("page 9", "pages 3, 5"), or a
-    POS-number reference ("Pos no. 12", "POS #3, 7"). Whether it's pages
-    or POS numbers is decided by whether "pos" appears anywhere in the
-    cell (case-insensitive, any spacing/punctuation); otherwise any
-    numbers found are treated as page numbers.
+    Accepts blank, "-", a page reference ("page 9", "pages 3, 5",
+    "pages 3-7", "page 1-page 6"), or a POS-number reference ("Pos no.
+    12", "POS #3, 7", "POS 1-8", "POS 1-3, POS 6-8", "POS 1-POS 6").
+    Ranges ("a-b") are expanded to every number in between, inclusive.
+    Whether a cell means pages or POS numbers is decided by whether "pos"
+    appears anywhere in the cell (case-insensitive, any spacing/
+    punctuation); otherwise any numbers found are treated as page
+    numbers. Matching is case-insensitive throughout.
     """
     if raw is None:
         return set(), set()
     s = str(raw).strip()
     if s == "" or s == "-":
         return set(), set()
-    nums = {int(x) for x in re.findall(r"\d+", s)}
+    nums = _expand_range_tokens(s)
     if not nums:
         return set(), set()
     if "pos" in s.lower():
