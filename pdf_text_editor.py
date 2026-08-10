@@ -490,6 +490,7 @@ def resolve_line_overlaps(insert_jobs, cover_rects):
 
 
 
+def find_near_miss_texts(spans, old):
     """A replace rule only matches text that is EXACTLY the same as `old`.
     If the PDF has a slightly different version of that text nearby (an
     extra word, a typo, different spacing -- e.g. the rule says "Aluclad
