@@ -446,7 +446,50 @@ def font_covers_text(fontkey, fontfile, text):
     return True
 
 
-def find_near_miss_texts(spans, old):
+def resolve_line_overlaps(insert_jobs, cover_rects):
+    """When two different replacements land on the same visual line close
+    together (e.g. a short bold label right next to a longer description
+    on the same row), a replacement text that's LONGER than the text it
+    replaced can run into the start of the next insertion and overlap it.
+
+    This measures each insertion's actual rendered width (using the real
+    font/size it will be drawn with, not a guess), and for any two
+    insertions on the same line where the first would run past where the
+    second starts, shifts the second (and anything after it on that line,
+    cascading) to the right by exactly the overflow amount -- then widens
+    that insertion's own cover rectangle to match its new extent, so the
+    now-larger gap is still painted white rather than showing old text.
+    """
+    from collections import defaultdict
+
+    lines = defaultdict(list)
+    for job in insert_jobs:
+        # Group by baseline, tolerating tiny rounding differences between
+        # jobs that are genuinely on the same printed line.
+        lines[round(job["y"])].append(job)
+
+    gap = 1.0  # small breathing room between adjacent pieces of text
+    for jobs in lines.values():
+        if len(jobs) < 2:
+            continue
+        jobs.sort(key=lambda j: j["x"])
+        for i in range(len(jobs) - 1):
+            cur = jobs[i]
+            font_obj = fitz.Font(fontfile=cur["fontfile"]) if cur["fontfile"] else fitz.Font(cur["fontkey"])
+            cur_width = font_obj.text_length(cur["text"], fontsize=cur["size"])
+            cur_end = cur["x"] + cur_width
+            nxt = jobs[i + 1]
+            if cur_end + gap <= nxt["x"]:
+                continue
+            shift = cur_end + gap - nxt["x"]
+            nxt["x"] += shift
+            nxt_font_obj = fitz.Font(fontfile=nxt["fontfile"]) if nxt["fontfile"] else fitz.Font(nxt["fontkey"])
+            nxt_width = nxt_font_obj.text_length(nxt["text"], fontsize=nxt["size"])
+            cover = cover_rects[nxt["cover_idx"]]
+            cover.x1 = max(cover.x1, nxt["x"] + nxt_width + gap)
+
+
+
     """A replace rule only matches text that is EXACTLY the same as `old`.
     If the PDF has a slightly different version of that text nearby (an
     extra word, a typo, different spacing -- e.g. the rule says "Aluclad
@@ -508,7 +551,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         pos_blocks = build_pos_blocks(spans, page.rect.y1)
 
         cover_rects = []
-        insert_jobs = []  # (x, y, text, fontname, fontfile_or_None, size)
+        insert_jobs = []  # list of dicts: x, y, text, fontkey, fontfile, size, cover_idx
 
         for rule_idx, rule in enumerate(replace_rules):
             old, new = rule["old"], rule["new"]
@@ -521,6 +564,17 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             if rule["only_pages"] and page_num not in rule["only_pages"]:
                 continue
             for rect in page.search_for(old):
+                # PyMuPDF's search_for() matches case-INSENSITIVELY by
+                # default, but these rules are documented (and promised in
+                # the instructions template) to be case-sensitive -- e.g. a
+                # rule for "AMSTERDAM F1" must not also catch "Amsterdam F1"
+                # elsewhere on the same line. Verify the actual text in this
+                # rect matches the rule's exact case before treating it as a
+                # real hit; a case-differing match is silently skipped here
+                # (not counted at all) so it doesn't inflate "not found"
+                # bookkeeping either.
+                if page.get_textbox(rect).strip() != old:
+                    continue
                 raw_hit_counts[rule_idx] += 1
 
                 # POS-number-based gates -- these need the actual match
@@ -571,7 +625,11 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 # "OTHER - 3 quantity:", gets reflowed after the new text
                 # instead of being overlapped by it).
                 cover_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, span_x1 + pad, rect.y1 + pad))
-                insert_jobs.append((rect.x0, baseline_y, combined_text, fontkey, fontfile, size))
+                insert_jobs.append({
+                    "x": rect.x0, "y": baseline_y, "text": combined_text,
+                    "fontkey": fontkey, "fontfile": fontfile, "size": size,
+                    "cover_idx": len(cover_rects) - 1,
+                })
                 total_replaced += 1
                 modified_pages.add(page_num)
 
@@ -585,6 +643,9 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 continue
             search_text, whole_line = delete_resolved[phrase_idx]
             for rect in page.search_for(search_text):
+                # Same case-sensitivity guard as the replace rules above.
+                if page.get_textbox(rect).strip() != search_text:
+                    continue
                 raw_delete_hit_counts[phrase_idx] += 1
 
                 if phrase_rule["only_pos"] or phrase_rule["except_pos"]:
@@ -624,6 +685,8 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         if not cover_rects:
             continue
 
+        resolve_line_overlaps(insert_jobs, cover_rects)
+
         # Non-destructive white overlay (rather than true redaction) --
         # redacting text can corrupt shared embedded font glyphs elsewhere
         # on the same page. The tradeoff: old text is visually hidden but
@@ -631,7 +694,10 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         for r in cover_rects:
             page.draw_rect(r, color=None, fill=(1, 1, 1), fill_opacity=1, overlay=True)
 
-        for x, y, text, fontkey, fontfile, size in insert_jobs:
+        for job in insert_jobs:
+            x, y, text, fontkey, fontfile, size = (
+                job["x"], job["y"], job["text"], job["fontkey"], job["fontfile"], job["size"]
+            )
             if fontfile:
                 page.insert_text((x, y), text, fontsize=size, fontname=fontkey,
                                   fontfile=fontfile, color=(0, 0, 0))
@@ -642,7 +708,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         # just the edited spot": re-check the page we just edited for any
         # inserted text unexpectedly overlapping something else.
         if insert_jobs:
-            inserted_specs = [(x, y, text) for x, y, text, *_ in insert_jobs]
+            inserted_specs = [(job["x"], job["y"], job["text"]) for job in insert_jobs]
             page_warnings = find_overlap_warnings(page, inserted_specs, cover_rects)
             if page_warnings:
                 overlap_warnings[page_num] = page_warnings
