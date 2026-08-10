@@ -553,6 +553,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
 
         cover_rects = []
         insert_jobs = []  # list of dicts: x, y, text, fontkey, fontfile, size, cover_idx
+        raw_hits = []  # collected across all rules before span-grouping (see below)
 
         for rule_idx, rule in enumerate(replace_rules):
             old, new = rule["old"], rule["new"]
@@ -588,24 +589,75 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                         continue
 
                 applied_hit_counts[rule_idx] += 1
-                span = find_containing_span(spans, rect)
-                pad = 0.4
-                if span is None:
-                    print(f"  [warn] page {page_num}: could not find styling for "
-                          f"'{old}' -- using a fallback font/position", file=sys.stderr)
-                    baseline_y = rect.y1 - (rect.y1 - rect.y0) * 0.2
-                    fontkey, fontfile = "helv", None
-                    size = rule["size"] or (rect.y1 - rect.y0) * 0.8
-                    span_x1 = rect.x1
-                    suffix = ""
-                else:
-                    baseline_y = span["origin"][1]
-                    fontkey, fontfile = resolve_font(span["font"], font_files)
-                    size = rule["size"] if rule["size"] else span["size"]
-                    span_x1 = span["bbox"][2]
-                    idx = span["text"].find(old)
-                    suffix = span["text"][idx + len(old):] if idx != -1 else ""
+                raw_hits.append({"rect": rect, "old": old, "new": new, "size": rule["size"]})
 
+            for variant_text in find_near_miss_texts(spans, old):
+                near_miss.setdefault(rule_idx, {}).setdefault(variant_text, set()).add(page_num)
+
+        # Two different rules can both match text that lives inside the
+        # SAME underlying span (e.g. a summary line like "6. AMSTERDAM F1
+        # - 5 quantity: - Hoppe Amsterdam F1 window handle, no key 303.75"
+        # is one span, and separate rules target "AMSTERDAM F1" and "Hoppe
+        # Amsterdam F1 window handle, no key" within it). Handling each
+        # hit in isolation -- covering/rewriting from its match to the end
+        # of the WHOLE span -- would make the earlier hit's rewrite
+        # duplicate everything the later hit is separately (and correctly)
+        # already handling, producing overlapping garbled text. Group hits
+        # by their containing span and bound each one's rewritten region
+        # to stop right before the next hit in that same span, instead of
+        # running all the way to the span's end.
+        pad = 0.4
+        hits_by_span = {}
+        standalone_hits = []
+        for hit in raw_hits:
+            span = find_containing_span(spans, hit["rect"])
+            hit["span"] = span
+            if span is None:
+                standalone_hits.append(hit)
+            else:
+                hits_by_span.setdefault(id(span), []).append(hit)
+
+        for hit in standalone_hits:
+            print(f"  [warn] page {page_num}: could not find styling for "
+                  f"'{hit['old']}' -- using a fallback font/position", file=sys.stderr)
+            rect = hit["rect"]
+            baseline_y = rect.y1 - (rect.y1 - rect.y0) * 0.2
+            fontkey, fontfile = "helv", None
+            size = hit["size"] or (rect.y1 - rect.y0) * 0.8
+            combined_text = hit["new"]
+            if not font_covers_text(fontkey, fontfile, combined_text):
+                fontkey, fontfile = _base14_for_style(fontkey), None
+            cover_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
+            insert_jobs.append({
+                "x": rect.x0, "y": baseline_y, "text": combined_text,
+                "fontkey": fontkey, "fontfile": fontfile, "size": size,
+                "cover_idx": len(cover_rects) - 1,
+            })
+            total_replaced += 1
+            modified_pages.add(page_num)
+
+        for span_hits in hits_by_span.values():
+            span = span_hits[0]["span"]
+            span_hits.sort(key=lambda h: h["rect"].x0)
+            baseline_y = span["origin"][1]
+            fontkey, fontfile = resolve_font(span["font"], font_files)
+            span_x1 = span["bbox"][2]
+            search_from = 0
+            for i, hit in enumerate(span_hits):
+                old, new, rect = hit["old"], hit["new"], hit["rect"]
+                idx = span["text"].find(old, search_from)
+                if idx == -1:
+                    idx = span["text"].find(old)
+                if i + 1 < len(span_hits):
+                    next_idx = span["text"].find(span_hits[i + 1]["old"], idx + len(old))
+                    suffix_end = next_idx if next_idx != -1 else len(span["text"])
+                    cover_x1 = span_hits[i + 1]["rect"].x0
+                else:
+                    suffix_end = len(span["text"])
+                    cover_x1 = span_x1
+                suffix = span["text"][idx + len(old):suffix_end] if idx != -1 else ""
+                search_from = suffix_end
+                size = hit["size"] if hit["size"] else span["size"]
                 combined_text = new + suffix
 
                 # The document's embedded font is usually a SUBSET containing
@@ -614,28 +666,27 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 # (a digit, an accent, a symbol...), using it anyway would
                 # render as a blank box. Fall back to a full-coverage builtin
                 # font (matching the same bold/italic style) in that case.
-                if not font_covers_text(fontkey, fontfile, combined_text):
-                    fallback_key = _base14_for_style(fontkey)
-                    print(f"  [warn] page {page_num}: font '{fontkey}' is missing a "
+                use_fontkey, use_fontfile = fontkey, fontfile
+                if not font_covers_text(use_fontkey, use_fontfile, combined_text):
+                    print(f"  [warn] page {page_num}: font '{use_fontkey}' is missing a "
                           f"character needed for '{combined_text}' -- falling back to "
                           f"a built-in font", file=sys.stderr)
-                    fontkey, fontfile = fallback_key, None
+                    use_fontkey, use_fontfile = _base14_for_style(use_fontkey), None
 
-                # Cover from the start of the old text through to the end of
-                # its span (so any trailing text sharing the same span, e.g.
-                # "OTHER - 3 quantity:", gets reflowed after the new text
-                # instead of being overlapped by it).
-                cover_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, span_x1 + pad, rect.y1 + pad))
+                # Cover from the start of the old text through to the start
+                # of the next hit in this span (or the end of the span if
+                # this is the last hit) -- so any trailing text sharing the
+                # span, e.g. "OTHER - 3 quantity:", gets reflowed after the
+                # new text instead of being overlapped by it, without
+                # stepping on territory another hit already owns.
+                cover_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, cover_x1 + pad, rect.y1 + pad))
                 insert_jobs.append({
                     "x": rect.x0, "y": baseline_y, "text": combined_text,
-                    "fontkey": fontkey, "fontfile": fontfile, "size": size,
+                    "fontkey": use_fontkey, "fontfile": use_fontfile, "size": size,
                     "cover_idx": len(cover_rects) - 1,
                 })
                 total_replaced += 1
                 modified_pages.add(page_num)
-
-            for variant_text in find_near_miss_texts(spans, old):
-                near_miss.setdefault(rule_idx, {}).setdefault(variant_text, set()).add(page_num)
 
         for phrase_idx, phrase_rule in enumerate(delete_phrases):
             if phrase_rule["except_pages"] and page_num in phrase_rule["except_pages"]:
