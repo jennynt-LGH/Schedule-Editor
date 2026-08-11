@@ -404,6 +404,19 @@ def find_overlap_warnings(page, inserted_specs, cover_rects):
     return warnings
 
 
+def _same_text_exact_case(extracted, expected):
+    """Case-sensitive equality that tolerates whitespace differences.
+    PyMuPDF's get_textbox() reconstructs spacing from glyph positions and
+    can occasionally introduce or drop a space compared to the literal
+    string a rule was typed with -- e.g. a slightly different inter-word
+    gap in one occurrence of an otherwise-identical phrase can make an
+    exact string comparison fail even though the actual letters (and
+    their case) match perfectly. Collapse runs of whitespace to a single
+    space on both sides before comparing so only real content differences
+    -- including case -- cause a mismatch."""
+    return " ".join(extracted.split()) == " ".join(expected.split())
+
+
 def _base14_for_style(name):
     """Pick a built-in base-14 font (full standard glyph coverage) that
     matches the bold/italic style implied by an original font's name."""
@@ -575,7 +588,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 # real hit; a case-differing match is silently skipped here
                 # (not counted at all) so it doesn't inflate "not found"
                 # bookkeeping either.
-                if page.get_textbox(rect).strip() != old:
+                if not _same_text_exact_case(page.get_textbox(rect), old):
                     continue
                 raw_hit_counts[rule_idx] += 1
 
@@ -696,7 +709,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             search_text, whole_line = delete_resolved[phrase_idx]
             for rect in page.search_for(search_text):
                 # Same case-sensitivity guard as the replace rules above.
-                if page.get_textbox(rect).strip() != search_text:
+                if not _same_text_exact_case(page.get_textbox(rect), search_text):
                     continue
                 raw_delete_hit_counts[phrase_idx] += 1
 
