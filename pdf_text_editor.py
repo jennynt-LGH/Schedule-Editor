@@ -232,16 +232,58 @@ def parse_instructions(xlsx_path):
 # ---------------------------------------------------------------------------
 
 def get_spans(page):
+    """Extract every text span on the page, using PyMuPDF's "rawdict" mode
+    so each span carries its individual characters' bounding boxes (not
+    just the span's own overall bbox). This lets us locate a substring's
+    exact rectangle directly from the page's own extracted text, instead
+    of re-querying the page with page.search_for() -- which, empirically,
+    can occasionally fail to find text that unambiguously exists (this
+    surfaced on one particular summary line where search_for() silently
+    returned no match at all for a phrase clearly present in the page's
+    own text). Searching within the extracted text we already trust
+    removes that failure mode entirely.
+    """
     spans = []
-    d = page.get_text("dict")
+    d = page.get_text("rawdict")
     for block in d["blocks"]:
+        if block.get("type") != 0:  # skip image blocks
+            continue
         for line in block.get("lines", []):
             line_bbox = line["bbox"]
             for span in line["spans"]:
                 span = dict(span)
                 span["line_bbox"] = line_bbox
+                chars = span.get("chars", [])
+                span["text"] = "".join(c["c"] for c in chars)
+                span["_chars"] = chars
                 spans.append(span)
     return spans
+
+
+def search_text_in_spans(spans, text):
+    """Find every exact, case-sensitive occurrence of `text` across all
+    spans on a page, returning a list of (fitz.Rect, span) pairs -- the
+    rect computed directly from the matched characters' own bounding
+    boxes. This is the replacement for page.search_for(text), used
+    throughout instead of it (see get_spans for why)."""
+    results = []
+    for span in spans:
+        span_text = span["text"]
+        chars = span["_chars"]
+        start = 0
+        while True:
+            idx = span_text.find(text, start)
+            if idx == -1:
+                break
+            matched = chars[idx: idx + len(text)]
+            if matched:
+                x0 = min(c["bbox"][0] for c in matched)
+                y0 = min(c["bbox"][1] for c in matched)
+                x1 = max(c["bbox"][2] for c in matched)
+                y1 = max(c["bbox"][3] for c in matched)
+                results.append((fitz.Rect(x0, y0, x1, y1), span))
+            start = idx + len(text)
+    return results
 
 
 _POS_LABEL_RE = re.compile(r"pos\.?\s*no\.?\s*(\d+)", re.IGNORECASE)
@@ -402,19 +444,6 @@ def find_overlap_warnings(page, inserted_specs, cover_rects):
                 f"'{other['text'].strip()}' -- check this page closely"
             )
     return warnings
-
-
-def _same_text_exact_case(extracted, expected):
-    """Case-sensitive equality that tolerates whitespace differences.
-    PyMuPDF's get_textbox() reconstructs spacing from glyph positions and
-    can occasionally introduce or drop a space compared to the literal
-    string a rule was typed with -- e.g. a slightly different inter-word
-    gap in one occurrence of an otherwise-identical phrase can make an
-    exact string comparison fail even though the actual letters (and
-    their case) match perfectly. Collapse runs of whitespace to a single
-    space on both sides before comparing so only real content differences
-    -- including case -- cause a mismatch."""
-    return " ".join(extracted.split()) == " ".join(expected.split())
 
 
 def _base14_for_style(name):
@@ -578,18 +607,11 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 continue
             if rule["only_pages"] and page_num not in rule["only_pages"]:
                 continue
-            for rect in page.search_for(old):
-                # PyMuPDF's search_for() matches case-INSENSITIVELY by
-                # default, but these rules are documented (and promised in
-                # the instructions template) to be case-sensitive -- e.g. a
-                # rule for "AMSTERDAM F1" must not also catch "Amsterdam F1"
-                # elsewhere on the same line. Verify the actual text in this
-                # rect matches the rule's exact case before treating it as a
-                # real hit; a case-differing match is silently skipped here
-                # (not counted at all) so it doesn't inflate "not found"
-                # bookkeeping either.
-                if not _same_text_exact_case(page.get_textbox(rect), old):
-                    continue
+            for rect, span in search_text_in_spans(spans, old):
+                # search_text_in_spans() only ever returns exact,
+                # case-sensitive matches (it searches the literal
+                # extracted text directly) -- so no separate case check
+                # is needed here the way page.search_for() used to need.
                 raw_hit_counts[rule_idx] += 1
 
                 # POS-number-based gates -- these need the actual match
@@ -602,7 +624,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                         continue
 
                 applied_hit_counts[rule_idx] += 1
-                raw_hits.append({"rect": rect, "old": old, "new": new, "size": rule["size"]})
+                raw_hits.append({"rect": rect, "old": old, "new": new, "size": rule["size"], "span": span})
 
             for variant_text in find_near_miss_texts(spans, old):
                 near_miss.setdefault(rule_idx, {}).setdefault(variant_text, set()).add(page_num)
@@ -623,8 +645,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         hits_by_span = {}
         standalone_hits = []
         for hit in raw_hits:
-            span = find_containing_span(spans, hit["rect"])
-            hit["span"] = span
+            span = hit["span"]
             if span is None:
                 standalone_hits.append(hit)
             else:
@@ -707,10 +728,9 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             if phrase_rule["only_pages"] and page_num not in phrase_rule["only_pages"]:
                 continue
             search_text, whole_line = delete_resolved[phrase_idx]
-            for rect in page.search_for(search_text):
-                # Same case-sensitivity guard as the replace rules above.
-                if not _same_text_exact_case(page.get_textbox(rect), search_text):
-                    continue
+            for rect, span in search_text_in_spans(spans, search_text):
+                # search_text_in_spans() only returns exact, case-sensitive
+                # matches, so no separate case check is needed here.
                 raw_delete_hit_counts[phrase_idx] += 1
 
                 if phrase_rule["only_pos"] or phrase_rule["except_pos"]:
@@ -720,7 +740,6 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                     if phrase_rule["except_pos"] and pos_num in phrase_rule["except_pos"]:
                         continue
 
-                span = find_containing_span(spans, rect)
                 pad = 0.4
                 if whole_line and span is not None:
                     # The instruction said to remove the entire line this
@@ -752,12 +771,17 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
 
         resolve_line_overlaps(insert_jobs, cover_rects)
 
-        # Non-destructive white overlay (rather than true redaction) --
-        # redacting text can corrupt shared embedded font glyphs elsewhere
-        # on the same page. The tradeoff: old text is visually hidden but
-        # technically still present/extractable underneath.
+        # True redaction: this removes the underlying text objects that
+        # intersect each cover rectangle from the page's content stream
+        # (not just painting over them), so a PDF viewer's search/copy no
+        # longer finds the old text underneath -- only a plain white box
+        # is left where it was, which we then draw the new text on top of.
+        # images=PDF_REDACT_IMAGE_NONE keeps this scoped to text only, so
+        # it can't affect the window/door diagrams even if a cover rect
+        # happens to sit close to one.
         for r in cover_rects:
-            page.draw_rect(r, color=None, fill=(1, 1, 1), fill_opacity=1, overlay=True)
+            page.add_redact_annot(r, fill=(1, 1, 1))
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
         for job in insert_jobs:
             x, y, text, fontkey, fontfile, size = (
