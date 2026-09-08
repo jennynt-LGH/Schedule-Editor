@@ -14,6 +14,14 @@ Instructions file format (first sheet):
         ...
         (a blank row ends the table)
 
+    "Replace from this" can list several exact alternatives for the SAME
+    "to this" text, separated by "|" -- e.g. "jonied onsite | joined
+    onsiet" both becoming "joined onsite". This is for different known
+    ways the same intended text can turn up broken (matching is always
+    an exact literal substring, never a pattern/wildcard, so each
+    alternative has to be spelled out), not for genuinely different
+    replacements -- those still need their own separate row.
+
     Table 2 (a row containing "Delete these words from PDF" starts it),
     which optionally takes the SAME "Only here" / "Skip this" columns:
         Delete these words from PDF | Only here | Skip this (don't apply to these)
@@ -186,15 +194,30 @@ def parse_instructions(xlsx_path):
                 except (TypeError, ValueError):
                     size = None
 
-                replace_rules.append({
-                    "old": str(old).strip(),
-                    "new": "" if new is None else str(new).strip(),
-                    "only_pages": only_pages,
-                    "only_pos": only_pos,
-                    "except_pages": except_pages,
-                    "except_pos": except_pos,
-                    "size": size,
-                })
+                # "Replace from this" can list several exact alternatives,
+                # separated by "|", that should all become the SAME "to
+                # this" text -- e.g. two different known-broken spellings
+                # of the same word (a PDF-generator glyph-ordering defect
+                # can scramble a word differently in different contexts)
+                # that both need to end up as the same correct text.
+                # Since matching is always an exact literal substring (no
+                # wildcards), each alternative becomes its own internal
+                # rule here, but they're written as one row for the user.
+                old_alternatives = [alt.strip() for alt in str(old).split("|")]
+                old_alternatives = [alt for alt in old_alternatives if alt]
+                row_group_id = i  # shared by every alternative from this one row
+
+                for old_alt in old_alternatives:
+                    replace_rules.append({
+                        "old": old_alt,
+                        "new": "" if new is None else str(new).strip(),
+                        "only_pages": only_pages,
+                        "only_pos": only_pos,
+                        "except_pages": except_pages,
+                        "except_pos": except_pos,
+                        "size": size,
+                        "row_group_id": row_group_id,
+                    })
                 i += 1
             continue
 
@@ -242,9 +265,16 @@ def get_spans(page):
     returned no match at all for a phrase clearly present in the page's
     own text). Searching within the extracted text we already trust
     removes that failure mode entirely.
+
+    Each span also gets a "line_idx" -- a per-page counter identifying
+    which of PyMuPDF's own "line" groupings it belongs to -- so spans
+    that make up one continuous printed line can be found and searched
+    together (see build_lines / search_text_in_lines), even when that
+    line happens to be split into several spans.
     """
     spans = []
     d = page.get_text("rawdict")
+    line_idx = 0
     for block in d["blocks"]:
         if block.get("type") != 0:  # skip image blocks
             continue
@@ -253,36 +283,86 @@ def get_spans(page):
             for span in line["spans"]:
                 span = dict(span)
                 span["line_bbox"] = line_bbox
+                span["line_idx"] = line_idx
                 chars = span.get("chars", [])
                 span["text"] = "".join(c["c"] for c in chars)
                 span["_chars"] = chars
                 spans.append(span)
+            line_idx += 1
     return spans
 
 
-def search_text_in_spans(spans, text):
-    """Find every exact, case-sensitive occurrence of `text` across all
-    spans on a page, returning a list of (fitz.Rect, span) pairs -- the
-    rect computed directly from the matched characters' own bounding
-    boxes. This is the replacement for page.search_for(text), used
-    throughout instead of it (see get_spans for why)."""
-    results = []
+def build_lines(spans):
+    """Group spans back into the printed lines PyMuPDF originally split
+    them from (via the line_idx get_spans tagged them with), and build
+    one continuous text string per line by concatenating that line's
+    spans left-to-right -- along with a per-character map back to
+    (span, local_char_index).
+
+    This exists because a single printed line isn't always one span: a
+    PDF generator will sometimes need a different embedded font for just
+    one character in the middle of an otherwise plain line -- most often
+    a diacritic (e.g. "osłonek") missing from the main subset font --
+    which silently splits that line into 2 or 3 spans even though it
+    looks completely uniform. Searching only within individual spans (as
+    a plain page-text search effectively does) will never find a phrase
+    that happens to cross such a split; searching each line's full
+    reassembled text does.
+    """
+    by_line = {}
     for span in spans:
-        span_text = span["text"]
-        chars = span["_chars"]
+        by_line.setdefault(span["line_idx"], []).append(span)
+
+    lines = []
+    for line_spans in by_line.values():
+        line_spans.sort(key=lambda s: s["bbox"][0])
+        text_parts = []
+        char_owners = []  # parallel to the concatenated text below
+        for span in line_spans:
+            for local_idx in range(len(span["_chars"])):
+                text_parts.append(span["_chars"][local_idx]["c"])
+                char_owners.append((span, local_idx))
+        lines.append({"text": "".join(text_parts), "char_owners": char_owners})
+    return lines
+
+
+def search_text_in_lines(lines, text):
+    """Find every exact, case-sensitive occurrence of `text` within each
+    line's full reassembled text (see build_lines) -- so a match can span
+    more than one underlying PDF span/font-run. Returns a list of dicts:
+    rect (built from the matched characters' own bounding boxes, across
+    however many spans they came from), the "primary" span the match
+    STARTS in (used for the replacement's font/size/baseline -- the
+    common case is a match entirely inside one span anyway, where this
+    is simply that span), the line, and the match's [start, end) character
+    offsets within that line's text (used later to bound how far a
+    suffix can be reflowed without overrunning a different, later hit on
+    the same line)."""
+    results = []
+    for line in lines:
+        line_text = line["text"]
+        owners = line["char_owners"]
         start = 0
         while True:
-            idx = span_text.find(text, start)
+            idx = line_text.find(text, start)
             if idx == -1:
                 break
-            matched = chars[idx: idx + len(text)]
-            if matched:
-                x0 = min(c["bbox"][0] for c in matched)
-                y0 = min(c["bbox"][1] for c in matched)
-                x1 = max(c["bbox"][2] for c in matched)
-                y1 = max(c["bbox"][3] for c in matched)
-                results.append((fitz.Rect(x0, y0, x1, y1), span))
-            start = idx + len(text)
+            end = idx + len(text)
+            matched_owners = owners[idx:end]
+            if matched_owners:
+                boxes = [owners[i][0]["_chars"][owners[i][1]]["bbox"] for i in range(idx, end)]
+                x0 = min(b[0] for b in boxes)
+                y0 = min(b[1] for b in boxes)
+                x1 = max(b[2] for b in boxes)
+                y1 = max(b[3] for b in boxes)
+                results.append({
+                    "rect": fitz.Rect(x0, y0, x1, y1),
+                    "span": matched_owners[0][0],
+                    "line": line,
+                    "start": idx,
+                    "end": end,
+                })
+            start = end
     return results
 
 
@@ -501,6 +581,15 @@ def resolve_line_overlaps(insert_jobs, cover_rects):
     cascading) to the right by exactly the overflow amount -- then widens
     that insertion's own cover rectangle to match its new extent, so the
     now-larger gap is still painted white rather than showing old text.
+
+    This is a backstop for cases the proactive line-flow positioning in
+    process() doesn't cover (e.g. a fallback/standalone insertion whose
+    baseline happens to coincide with another line). It only nudges
+    something when there's genuine overlap -- not a plain "settle any two
+    insertions on any line a bit apart", since the calling code has
+    already positioned suffix-linked hits exactly flush with no gap on
+    purpose, and adding one back in here would silently reintroduce the
+    "unwanted extra space" this whole approach exists to avoid.
     """
     from collections import defaultdict
 
@@ -510,7 +599,7 @@ def resolve_line_overlaps(insert_jobs, cover_rects):
         # jobs that are genuinely on the same printed line.
         lines[round(job["y"])].append(job)
 
-    gap = 1.0  # small breathing room between adjacent pieces of text
+    epsilon = 0.05  # floating-point safety margin only, not a visible gap
     for jobs in lines.values():
         if len(jobs) < 2:
             continue
@@ -521,14 +610,14 @@ def resolve_line_overlaps(insert_jobs, cover_rects):
             cur_width = font_obj.text_length(cur["text"], fontsize=cur["size"])
             cur_end = cur["x"] + cur_width
             nxt = jobs[i + 1]
-            if cur_end + gap <= nxt["x"]:
+            if cur_end <= nxt["x"] + epsilon:
                 continue
-            shift = cur_end + gap - nxt["x"]
+            shift = cur_end - nxt["x"]
             nxt["x"] += shift
             nxt_font_obj = fitz.Font(fontfile=nxt["fontfile"]) if nxt["fontfile"] else fitz.Font(nxt["fontkey"])
             nxt_width = nxt_font_obj.text_length(nxt["text"], fontsize=nxt["size"])
             cover = cover_rects[nxt["cover_idx"]]
-            cover.x1 = max(cover.x1, nxt["x"] + nxt_width + gap)
+            cover.x1 = max(cover.x1, nxt["x"] + nxt_width)
 
 
 
@@ -591,6 +680,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         page = doc[pno]
         page_num = pno + 1
         spans = get_spans(page)
+        lines = build_lines(spans)
         pos_blocks = build_pos_blocks(spans, page.rect.y1)
 
         cover_rects = []
@@ -607,8 +697,9 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 continue
             if rule["only_pages"] and page_num not in rule["only_pages"]:
                 continue
-            for rect, span in search_text_in_spans(spans, old):
-                # search_text_in_spans() only ever returns exact,
+            for hit in search_text_in_lines(lines, old):
+                rect = hit["rect"]
+                # search_text_in_lines() only ever returns exact,
                 # case-sensitive matches (it searches the literal
                 # extracted text directly) -- so no separate case check
                 # is needed here the way page.search_for() used to need.
@@ -624,32 +715,36 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                         continue
 
                 applied_hit_counts[rule_idx] += 1
-                raw_hits.append({"rect": rect, "old": old, "new": new, "size": rule["size"], "span": span})
+                raw_hits.append({
+                    "rect": rect, "old": old, "new": new, "size": rule["size"],
+                    "span": hit["span"], "line": hit["line"],
+                    "start": hit["start"], "end": hit["end"],
+                })
 
             for variant_text in find_near_miss_texts(spans, old):
                 near_miss.setdefault(rule_idx, {}).setdefault(variant_text, set()).add(page_num)
 
-        # Two different rules can both match text that lives inside the
-        # SAME underlying span (e.g. a summary line like "6. AMSTERDAM F1
-        # - 5 quantity: - Hoppe Amsterdam F1 window handle, no key 303.75"
-        # is one span, and separate rules target "AMSTERDAM F1" and "Hoppe
+        # Two different rules can both match text that lives on the SAME
+        # underlying printed line (e.g. a summary line like "6. AMSTERDAM
+        # F1 - 5 quantity: - Hoppe Amsterdam F1 window handle, no key
+        # 303.75", where separate rules target "AMSTERDAM F1" and "Hoppe
         # Amsterdam F1 window handle, no key" within it). Handling each
         # hit in isolation -- covering/rewriting from its match to the end
-        # of the WHOLE span -- would make the earlier hit's rewrite
+        # of the WHOLE line -- would make the earlier hit's rewrite
         # duplicate everything the later hit is separately (and correctly)
         # already handling, producing overlapping garbled text. Group hits
-        # by their containing span and bound each one's rewritten region
-        # to stop right before the next hit in that same span, instead of
-        # running all the way to the span's end.
+        # by their line and bound each one's rewritten region to stop
+        # right before the next hit on that same line, instead of running
+        # all the way to the line's end.
         pad = 0.4
-        hits_by_span = {}
+        hits_by_line = {}
         standalone_hits = []
         for hit in raw_hits:
             span = hit["span"]
             if span is None:
                 standalone_hits.append(hit)
             else:
-                hits_by_span.setdefault(id(span), []).append(hit)
+                hits_by_line.setdefault(id(hit["line"]), []).append(hit)
 
         for hit in standalone_hits:
             print(f"  [warn] page {page_num}: could not find styling for "
@@ -670,29 +765,25 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             total_replaced += 1
             modified_pages.add(page_num)
 
-        for span_hits in hits_by_span.values():
-            span = span_hits[0]["span"]
-            span_hits.sort(key=lambda h: h["rect"].x0)
-            baseline_y = span["origin"][1]
-            fontkey, fontfile = resolve_font(span["font"], font_files)
-            span_x1 = span["bbox"][2]
-            search_from = 0
-            for i, hit in enumerate(span_hits):
-                old, new, rect = hit["old"], hit["new"], hit["rect"]
-                idx = span["text"].find(old, search_from)
-                if idx == -1:
-                    idx = span["text"].find(old)
-                if i + 1 < len(span_hits):
-                    next_idx = span["text"].find(span_hits[i + 1]["old"], idx + len(old))
-                    suffix_end = next_idx if next_idx != -1 else len(span["text"])
-                    cover_x1 = span_hits[i + 1]["rect"].x0
+        for line_hits in hits_by_line.values():
+            line = line_hits[0]["line"]
+            line_hits.sort(key=lambda h: h["rect"].x0)
+            flow_x = None  # where the previous hit's rendered text actually ended
+            for i, hit in enumerate(line_hits):
+                span = hit["span"]
+                rect = hit["rect"]
+                baseline_y = span["origin"][1]
+                fontkey, fontfile = resolve_font(span["font"], font_files)
+                idx, end = hit["start"], hit["end"]
+                if i + 1 < len(line_hits):
+                    suffix_end = line_hits[i + 1]["start"]
+                    cover_x1 = line_hits[i + 1]["rect"].x0
                 else:
-                    suffix_end = len(span["text"])
-                    cover_x1 = span_x1
-                suffix = span["text"][idx + len(old):suffix_end] if idx != -1 else ""
-                search_from = suffix_end
+                    suffix_end = len(line["text"])
+                    cover_x1 = span["line_bbox"][2]
+                suffix = line["text"][end:suffix_end]
                 size = hit["size"] if hit["size"] else span["size"]
-                combined_text = new + suffix
+                combined_text = hit["new"] + suffix
 
                 # The document's embedded font is usually a SUBSET containing
                 # only the glyphs the original file actually used. If the
@@ -707,15 +798,37 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                           f"a built-in font", file=sys.stderr)
                     use_fontkey, use_fontfile = _base14_for_style(use_fontkey), None
 
-                # Cover from the start of the old text through to the start
-                # of the next hit in this span (or the end of the span if
-                # this is the last hit) -- so any trailing text sharing the
-                # span, e.g. "OTHER - 3 quantity:", gets reflowed after the
-                # new text instead of being overlapped by it, without
-                # stepping on territory another hit already owns.
-                cover_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, cover_x1 + pad, rect.y1 + pad))
+                # Where to actually draw this hit's text. The FIRST hit on a
+                # line keeps its original position. Every hit after that
+                # starts exactly where the PREVIOUS hit's own inserted text
+                # (combined_text, suffix included) actually ends -- not at
+                # its own old position -- because that suffix already
+                # contains everything that used to sit between the two
+                # hits (e.g. ": "). If we left it at its old position
+                # instead, a replacement that's SHORTER than what it
+                # replaced (e.g. "Kolor osłonek" -> "Hinge caps") would
+                # leave a stretch of dead white space where the extra
+                # length used to be, and a LONGER replacement would
+                # overlap the next hit -- this single rule fixes both.
+                x = rect.x0 if flow_x is None else flow_x
+                font_obj = fitz.Font(fontfile=use_fontfile) if use_fontfile else fitz.Font(use_fontkey)
+                rendered_width = font_obj.text_length(combined_text, fontsize=size)
+                flow_x = x + rendered_width
+
+                # Cover from the start of the old text (or, if this hit's
+                # new position was pulled left of that, from the new
+                # position instead) through to the start of the next hit on
+                # this line, or however far the new text actually reaches
+                # if that's further right than the next old hit started --
+                # so any trailing text sharing the line, e.g. "OTHER - 3
+                # quantity:", gets reflowed after the new text instead of
+                # being overlapped by it, without stepping on territory
+                # another hit already owns.
+                cover_x0 = min(rect.x0, x)
+                cover_x1 = max(cover_x1, flow_x)
+                cover_rects.append(fitz.Rect(cover_x0 - pad, rect.y0 - pad, cover_x1 + pad, rect.y1 + pad))
                 insert_jobs.append({
-                    "x": rect.x0, "y": baseline_y, "text": combined_text,
+                    "x": x, "y": baseline_y, "text": combined_text,
                     "fontkey": use_fontkey, "fontfile": use_fontfile, "size": size,
                     "cover_idx": len(cover_rects) - 1,
                 })
@@ -728,8 +841,9 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             if phrase_rule["only_pages"] and page_num not in phrase_rule["only_pages"]:
                 continue
             search_text, whole_line = delete_resolved[phrase_idx]
-            for rect, span in search_text_in_spans(spans, search_text):
-                # search_text_in_spans() only returns exact, case-sensitive
+            for hit in search_text_in_lines(lines, search_text):
+                rect, span = hit["rect"], hit["span"]
+                # search_text_in_lines() only returns exact, case-sensitive
                 # matches, so no separate case check is needed here.
                 raw_delete_hit_counts[phrase_idx] += 1
 
@@ -820,13 +934,35 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     # than applied_hit_counts, so a rule correctly restricted down to zero
     # actual edits by its own Only/Except settings does NOT get flagged --
     # that's the sheet working as intended, not a mistake.
+    #
+    # A row that listed several "|" alternatives is only flagged if NONE
+    # of them matched anything -- finding some alternatives but not
+    # others in a given document is exactly what listing alternatives is
+    # FOR (different documents can have different known-broken spellings
+    # of the same word), not a mistake to warn about.
+    warned_groups = set()
     for rule_idx, rule in enumerate(replace_rules):
+        group_id = rule.get("row_group_id")
         if raw_hit_counts[rule_idx] == 0:
-            not_found_warnings.append(
-                f"Replace rule '{rule['old']}' -> '{rule['new']}' was not "
-                f"found anywhere in the PDF (outside any Only/Except pages) -- "
-                f"double-check the spelling/spacing matches the PDF exactly."
-            )
+            sibling_idxs = [
+                j for j, r in enumerate(replace_rules)
+                if r.get("row_group_id") == group_id
+            ]
+            if all(raw_hit_counts[j] == 0 for j in sibling_idxs) and group_id not in warned_groups:
+                warned_groups.add(group_id)
+                if len(sibling_idxs) > 1:
+                    alternatives = " | ".join(replace_rules[j]["old"] for j in sibling_idxs)
+                    not_found_warnings.append(
+                        f"None of the alternatives '{alternatives}' -> '{rule['new']}' "
+                        f"were found anywhere in the PDF (outside any Only/Except pages) -- "
+                        f"double-check the spelling/spacing matches the PDF exactly."
+                    )
+                else:
+                    not_found_warnings.append(
+                        f"Replace rule '{rule['old']}' -> '{rule['new']}' was not "
+                        f"found anywhere in the PDF (outside any Only/Except pages) -- "
+                        f"double-check the spelling/spacing matches the PDF exactly."
+                    )
         variants = near_miss.get(rule_idx)
         if variants:
             for variant_text, pgs in variants.items():
