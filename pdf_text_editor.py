@@ -683,6 +683,10 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         lines = build_lines(spans)
         pos_blocks = build_pos_blocks(spans, page.rect.y1)
 
+        redact_pos_nums = []  # POS-block number (or None) for each redact_rects entry,
+                               # used to detect "2+ edits in one shared item
+                               # block" and downgrade those to safe masking
+                               # (see the note further down for why)
         redact_rects = []  # tight rects around the EXACT old text being
                             # removed/replaced -- these get TRUE redaction
         mask_rects = []    # rects covering only REPOSITIONING territory
@@ -771,6 +775,8 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             if not font_covers_text(fontkey, fontfile, combined_text):
                 fontkey, fontfile = _base14_for_style(fontkey), None
             redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
+            redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
+            redact_idx = len(redact_rects) - 1
             # No reflow gap here (no suffix to bridge), but insert_jobs
             # always tracks a mask_rects entry for resolve_line_overlaps to
             # extend if it ever needs to -- start it zero-width.
@@ -779,6 +785,8 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 "x": rect.x0, "y": baseline_y, "text": combined_text,
                 "fontkey": fontkey, "fontfile": fontfile, "size": size,
                 "cover_idx": len(mask_rects) - 1,
+                "redact_idx": redact_idx,
+                "mask_indices": [len(mask_rects) - 1],
             })
             total_replaced += 1
             modified_pages.add(page_num)
@@ -852,15 +860,21 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 # is pure repositioning, not sensitive replaced content, so
                 # it gets the safer non-destructive mask instead.
                 redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
+                redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
+                redact_idx = len(redact_rects) - 1
                 mask_rects.append(fitz.Rect(rect.x1 - pad, rect.y0 - pad, cover_x1 + pad, rect.y1 + pad))
                 mask_idx = len(mask_rects) - 1
+                mask_indices = [mask_idx]
                 if cover_x0 < rect.x0 - 1e-6:
                     mask_rects.append(fitz.Rect(cover_x0 - pad, rect.y0 - pad, rect.x0 + pad, rect.y1 + pad))
+                    mask_indices.append(len(mask_rects) - 1)
 
                 insert_jobs.append({
                     "x": x, "y": baseline_y, "text": combined_text,
                     "fontkey": use_fontkey, "fontfile": use_fontfile, "size": size,
                     "cover_idx": mask_idx,
+                    "redact_idx": redact_idx,
+                    "mask_indices": mask_indices,
                 })
                 total_replaced += 1
                 modified_pages.add(page_num)
@@ -895,6 +909,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                     # the whole "U-value (W/m2K)= 1.39" line.
                     lx0, ly0, lx1, ly1 = span.get("line_bbox", span["bbox"])
                     redact_rects.append(fitz.Rect(lx0 - pad, ly0 - pad, lx1 + pad, ly1 + pad))
+                    redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
                     total_deleted += 1
                     modified_pages.add(page_num)
                     continue
@@ -906,10 +921,12 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                         # so no dangling punctuation is left behind.
                         bx0, by0, bx1, by1 = span["bbox"]
                         redact_rects.append(fitz.Rect(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad))
+                        redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
                         total_deleted += 1
                         modified_pages.add(page_num)
                         continue
                 redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
+                redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
                 total_deleted += 1
                 modified_pages.add(page_num)
 
@@ -917,6 +934,51 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             continue
 
         resolve_line_overlaps(insert_jobs, mask_rects)
+
+        # Map each redact_rects index to the insert_job (if any) it belongs
+        # to, so each hit's full lifecycle -- redact its old text, mask its
+        # reflow gap, draw its new text -- can be finished completely
+        # before moving to the next hit.
+        job_by_redact_idx = {}
+        for job in insert_jobs:
+            ridx = job.get("redact_idx")
+            if ridx is not None:
+                job_by_redact_idx[ridx] = job
+
+        def _draw_insert(job):
+            x, y, text, fontkey, fontfile, size = (
+                job["x"], job["y"], job["text"], job["fontkey"], job["fontfile"], job["size"]
+            )
+            if fontfile:
+                page.insert_text((x, y), text, fontsize=size, fontname=fontkey,
+                                  fontfile=fontfile, color=(0, 0, 0))
+            else:
+                page.insert_text((x, y), text, fontsize=size, fontname=fontkey, color=(0, 0, 0))
+
+        # Some PDF generators draw a whole block of lines for one item
+        # (System:/Colour:/Glass:/U-value/... ) as a SINGLE shared text
+        # object, with each line positioned RELATIVE to the one before it.
+        # Testing showed that whenever true redaction touches that same
+        # shared object TWICE (two separate edits landing in two different
+        # lines of one item), PyMuPDF's reconstruction of the object after
+        # the second redaction corrupts other lines in it -- regardless of
+        # what order the edits are applied in, whether they're batched or
+        # applied one at a time, or whether the earlier edit's replacement
+        # text was already drawn first. That rules out a fix on our end for
+        # the double-redaction case itself, so instead: only use true
+        # redaction where it's PROVEN safe -- exactly one edit in a given
+        # item's (POS-block's) attribute block -- and fall back to the
+        # older, always-safe non-destructive mask for every edit in any
+        # item that has two or more. This keeps true redaction's benefit
+        # (old text genuinely unsearchable) for the common single-edit
+        # case, without risking corrupting an item that needs several.
+        from collections import Counter
+        pos_counts = Counter(redact_pos_nums)
+        risky_indices = {i for i, p in enumerate(redact_pos_nums) if pos_counts[p] >= 2}
+        if risky_indices:
+            print(f"  [note] page {page_num}: {len(risky_indices)} edit(s) share an item "
+                  f"block with another edit -- using the safe non-destructive mask for "
+                  f"those instead of true redaction (see module docstring)", file=sys.stderr)
 
         # The old text actually being replaced/deleted gets TRUE redaction
         # -- removed from the page's content stream, not just painted over
@@ -926,27 +988,38 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         # images=PDF_REDACT_IMAGE_NONE keeps this scoped to text only, so
         # it can't affect the window/door diagrams even if a rect happens
         # to sit close to one.
-        if redact_rects:
-            for r in redact_rects:
-                page.add_redact_annot(r, fill=(1, 1, 1))
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        # Pure repositioning territory (the gap a replacement's length
-        # difference opens or closes) is NOT the sensitive replaced
-        # content itself, so it only needs a non-destructive white
-        # overlay -- painted on top, not removed from the content stream.
-        for r in mask_rects:
-            page.draw_rect(r, color=None, fill=(1, 1, 1), fill_opacity=1, overlay=True)
-
-        for job in insert_jobs:
-            x, y, text, fontkey, fontfile, size = (
-                job["x"], job["y"], job["text"], job["fontkey"], job["fontfile"], job["size"]
-            )
-            if fontfile:
-                page.insert_text((x, y), text, fontsize=size, fontname=fontkey,
-                                  fontfile=fontfile, color=(0, 0, 0))
+        #
+        # Each hit's redact -> mask -> insert is done as one complete,
+        # finished unit before starting the next hit's, for any hit that
+        # still uses true redaction (see risky_indices above for the ones
+        # that don't).
+        for i, r in enumerate(redact_rects):
+            if i in risky_indices:
+                page.draw_rect(r, color=None, fill=(1, 1, 1), fill_opacity=1, overlay=True)
             else:
-                page.insert_text((x, y), text, fontsize=size, fontname=fontkey, color=(0, 0, 0))
+                page.add_redact_annot(r, fill=(1, 1, 1))
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            job = job_by_redact_idx.get(i)
+            if job is not None:
+                for midx in job["mask_indices"]:
+                    page.draw_rect(mask_rects[midx], color=None, fill=(1, 1, 1),
+                                    fill_opacity=1, overlay=True)
+                _draw_insert(job)
+
+        # Any mask rects not tied to a specific redaction (there currently
+        # are none by construction, but this keeps behavior correct if that
+        # ever changes) still get painted.
+        drawn_mask_indices = {midx for job in insert_jobs for midx in job["mask_indices"]}
+        for midx, r in enumerate(mask_rects):
+            if midx not in drawn_mask_indices:
+                page.draw_rect(r, color=None, fill=(1, 1, 1), fill_opacity=1, overlay=True)
+
+        # Any insert job that somehow isn't tied to a redaction (shouldn't
+        # happen given how insert_jobs are built, but keeps behavior
+        # correct if that ever changes) still gets drawn.
+        for job in insert_jobs:
+            if job.get("redact_idx") is None:
+                _draw_insert(job)
 
         # Automated stand-in for a human eyeballing "the whole page, not
         # just the edited spot": re-check the page we just edited for any
