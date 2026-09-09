@@ -683,8 +683,22 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         lines = build_lines(spans)
         pos_blocks = build_pos_blocks(spans, page.rect.y1)
 
-        cover_rects = []
-        insert_jobs = []  # list of dicts: x, y, text, fontkey, fontfile, size, cover_idx
+        redact_rects = []  # tight rects around the EXACT old text being
+                            # removed/replaced -- these get TRUE redaction
+        mask_rects = []    # rects covering only REPOSITIONING territory
+                            # (the gap a shorter/longer replacement opens or
+                            # closes, or unmatched text being reflowed) --
+                            # these get the older, non-destructive white
+                            # overlay instead. Splitting the two apart keeps
+                            # redaction's footprint as small as possible:
+                            # some PDF generators draw a whole multi-line
+                            # attribute block as one internal text object,
+                            # and redacting a large rect that merely touches
+                            # such a block can wipe out far more than
+                            # intended. A tight redaction rect around just
+                            # the actual old word/phrase is much less likely
+                            # to trigger that.
+        insert_jobs = []  # list of dicts: x, y, text, fontkey, fontfile, size, cover_idx (-> mask_rects)
         raw_hits = []  # collected across all rules before span-grouping (see below)
 
         for rule_idx, rule in enumerate(replace_rules):
@@ -756,11 +770,15 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             combined_text = hit["new"]
             if not font_covers_text(fontkey, fontfile, combined_text):
                 fontkey, fontfile = _base14_for_style(fontkey), None
-            cover_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
+            redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
+            # No reflow gap here (no suffix to bridge), but insert_jobs
+            # always tracks a mask_rects entry for resolve_line_overlaps to
+            # extend if it ever needs to -- start it zero-width.
+            mask_rects.append(fitz.Rect(rect.x1 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
             insert_jobs.append({
                 "x": rect.x0, "y": baseline_y, "text": combined_text,
                 "fontkey": fontkey, "fontfile": fontfile, "size": size,
-                "cover_idx": len(cover_rects) - 1,
+                "cover_idx": len(mask_rects) - 1,
             })
             total_replaced += 1
             modified_pages.add(page_num)
@@ -826,11 +844,23 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 # another hit already owns.
                 cover_x0 = min(rect.x0, x)
                 cover_x1 = max(cover_x1, flow_x)
-                cover_rects.append(fitz.Rect(cover_x0 - pad, rect.y0 - pad, cover_x1 + pad, rect.y1 + pad))
+
+                # The OLD TEXT ITSELF gets a tight, exact-fit true-redaction
+                # rect (see the note on redact_rects/mask_rects above).
+                # Everything else in the covered span -- the gap before or
+                # after it that only exists to reflow surrounding text --
+                # is pure repositioning, not sensitive replaced content, so
+                # it gets the safer non-destructive mask instead.
+                redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
+                mask_rects.append(fitz.Rect(rect.x1 - pad, rect.y0 - pad, cover_x1 + pad, rect.y1 + pad))
+                mask_idx = len(mask_rects) - 1
+                if cover_x0 < rect.x0 - 1e-6:
+                    mask_rects.append(fitz.Rect(cover_x0 - pad, rect.y0 - pad, rect.x0 + pad, rect.y1 + pad))
+
                 insert_jobs.append({
                     "x": x, "y": baseline_y, "text": combined_text,
                     "fontkey": use_fontkey, "fontfile": use_fontfile, "size": size,
-                    "cover_idx": len(cover_rects) - 1,
+                    "cover_idx": mask_idx,
                 })
                 total_replaced += 1
                 modified_pages.add(page_num)
@@ -855,13 +885,16 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                         continue
 
                 pad = 0.4
+                # Delete phrases always genuinely remove content (there's no
+                # replacement text to reflow around), so everything here
+                # goes straight to true redaction.
                 if whole_line and span is not None:
                     # The instruction said to remove the entire line this
                     # text lives on, not just the matched words -- e.g.
                     # "the whole line of 'U-value (W/m2K)'" means delete
                     # the whole "U-value (W/m2K)= 1.39" line.
                     lx0, ly0, lx1, ly1 = span.get("line_bbox", span["bbox"])
-                    cover_rects.append(fitz.Rect(lx0 - pad, ly0 - pad, lx1 + pad, ly1 + pad))
+                    redact_rects.append(fitz.Rect(lx0 - pad, ly0 - pad, lx1 + pad, ly1 + pad))
                     total_deleted += 1
                     modified_pages.add(page_num)
                     continue
@@ -872,30 +905,38 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                         # (plus separators like " - ") -- remove all of it
                         # so no dangling punctuation is left behind.
                         bx0, by0, bx1, by1 = span["bbox"]
-                        cover_rects.append(fitz.Rect(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad))
+                        redact_rects.append(fitz.Rect(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad))
                         total_deleted += 1
                         modified_pages.add(page_num)
                         continue
-                cover_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
+                redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
                 total_deleted += 1
                 modified_pages.add(page_num)
 
-        if not cover_rects:
+        if not redact_rects and not mask_rects:
             continue
 
-        resolve_line_overlaps(insert_jobs, cover_rects)
+        resolve_line_overlaps(insert_jobs, mask_rects)
 
-        # True redaction: this removes the underlying text objects that
-        # intersect each cover rectangle from the page's content stream
-        # (not just painting over them), so a PDF viewer's search/copy no
-        # longer finds the old text underneath -- only a plain white box
-        # is left where it was, which we then draw the new text on top of.
+        # The old text actually being replaced/deleted gets TRUE redaction
+        # -- removed from the page's content stream, not just painted over
+        # -- so a PDF viewer's search/copy no longer finds it. Kept as
+        # tight, minimal rects (see redact_rects/mask_rects note above) to
+        # limit how much surrounding content a redaction could ever touch.
         # images=PDF_REDACT_IMAGE_NONE keeps this scoped to text only, so
-        # it can't affect the window/door diagrams even if a cover rect
-        # happens to sit close to one.
-        for r in cover_rects:
-            page.add_redact_annot(r, fill=(1, 1, 1))
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        # it can't affect the window/door diagrams even if a rect happens
+        # to sit close to one.
+        if redact_rects:
+            for r in redact_rects:
+                page.add_redact_annot(r, fill=(1, 1, 1))
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        # Pure repositioning territory (the gap a replacement's length
+        # difference opens or closes) is NOT the sensitive replaced
+        # content itself, so it only needs a non-destructive white
+        # overlay -- painted on top, not removed from the content stream.
+        for r in mask_rects:
+            page.draw_rect(r, color=None, fill=(1, 1, 1), fill_opacity=1, overlay=True)
 
         for job in insert_jobs:
             x, y, text, fontkey, fontfile, size = (
@@ -912,7 +953,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         # inserted text unexpectedly overlapping something else.
         if insert_jobs:
             inserted_specs = [(job["x"], job["y"], job["text"]) for job in insert_jobs]
-            page_warnings = find_overlap_warnings(page, inserted_specs, cover_rects)
+            page_warnings = find_overlap_warnings(page, inserted_specs, redact_rects + mask_rects)
             if page_warnings:
                 overlap_warnings[page_num] = page_warnings
                 for w in page_warnings:
