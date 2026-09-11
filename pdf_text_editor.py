@@ -270,12 +270,18 @@ def get_spans(page):
     which of PyMuPDF's own "line" groupings it belongs to -- so spans
     that make up one continuous printed line can be found and searched
     together (see build_lines / search_text_in_lines), even when that
-    line happens to be split into several spans.
+    line happens to be split into several spans. It also gets a
+    "block_idx", identifying which of PyMuPDF's own "block" groupings
+    (a level above "line") it belongs to -- some PDF generators draw a
+    whole multi-line attribute paragraph as one shared block/text object,
+    and this lets code elsewhere detect "these two edits fall in the same
+    underlying block" to avoid a redaction-corruption failure mode that's
+    specific to editing such a block more than once.
     """
     spans = []
     d = page.get_text("rawdict")
     line_idx = 0
-    for block in d["blocks"]:
+    for block_idx, block in enumerate(d["blocks"]):
         if block.get("type") != 0:  # skip image blocks
             continue
         for line in block.get("lines", []):
@@ -284,6 +290,7 @@ def get_spans(page):
                 span = dict(span)
                 span["line_bbox"] = line_bbox
                 span["line_idx"] = line_idx
+                span["block_idx"] = block_idx
                 chars = span.get("chars", [])
                 span["text"] = "".join(c["c"] for c in chars)
                 span["_chars"] = chars
@@ -439,7 +446,21 @@ def find_containing_span(spans, rect):
 
 def extract_all_fonts(doc, workdir):
     """Extract every embedded font in the document to disk, keyed by base
-    font name (subset prefix like 'ABCDEF+' stripped)."""
+    font name (subset prefix like 'ABCDEF+' stripped) -- as a LIST of
+    every distinct subset found under that name, not just one.
+
+    PDF generators very commonly re-subset the same font independently
+    per page (or per text block), each subset embedding only the glyphs
+    THAT one instance actually uses. Two pages' "Arial", for example, can
+    be two genuinely different files with different glyph coverage --
+    one might include a Polish diacritic the other doesn't. Keeping only
+    the last one seen (as an earlier version of this function did) meant
+    a later page's lookup of "Arial" could silently get a DIFFERENT,
+    incomplete subset that's missing a character the current text
+    actually needs, even though some other subset earlier in the
+    document has it. Keeping every subset and letting the caller check
+    actual glyph coverage (see resolve_font_for_text) avoids that.
+    """
     font_files = {}
     seen = set()
     for page in doc:
@@ -458,10 +479,10 @@ def extract_all_fonts(doc, workdir):
             ext, buf = info[1], info[3]
             if not buf:
                 continue
-            path = os.path.join(workdir, f"{base_name}.{ext or 'ttf'}")
+            path = os.path.join(workdir, f"{base_name}.{xref}.{ext or 'ttf'}")
             with open(path, "wb") as fh:
                 fh.write(buf)
-            font_files[base_name] = path
+            font_files.setdefault(base_name, []).append(path)
     return font_files
 
 
@@ -539,13 +560,27 @@ def _base14_for_style(name):
     return "helv"
 
 
-def resolve_font(span_font_name, font_files):
-    """Return (fontname, fontfile_or_None) for insert_text()."""
+def resolve_font_for_text(span_font_name, font_files, text):
+    """Return (fontname, fontfile_or_None) for insert_text(), specifically
+    chosen so the returned font actually covers every character in `text`
+    -- not just assumed to, based on name alone.
+
+    font_files maps a base font name to a LIST of every distinct embedded
+    subset found under that name anywhere in the document (see
+    extract_all_fonts for why there can be more than one). Different
+    subsets of the "same" font can have different glyph coverage, so this
+    tries each one against the actual text being inserted here and uses
+    the first that works, rather than an arbitrary one that happens to be
+    missing a character this particular insertion needs. Falls back to a
+    built-in base-14 font (matching bold/italic style) only if none of
+    the embedded subsets found under this name cover the text either.
+    """
     name = span_font_name or ""
     if "+" in name:
         name = name.split("+", 1)[1]
-    if name in font_files:
-        return name, font_files[name]
+    for candidate_path in font_files.get(name, []):
+        if font_covers_text(name, candidate_path, text):
+            return name, candidate_path
     return _base14_for_style(name), None
 
 
@@ -659,6 +694,22 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     doc = fitz.open(input_pdf)
     workdir = tempfile.mkdtemp()
     font_files = extract_all_fonts(doc, workdir)
+    _scratch_path = os.path.join(workdir, "_redaction_scratch.pdf")
+
+    def _flush_and_reopen(doc, pno):
+        """Save the in-progress document to disk and reopen it fresh,
+        returning (new_doc, new_page_at_pno). See the long comment at the
+        true-redaction call site for why this exists: PyMuPDF's redaction
+        was observed to corrupt unrelated, unedited text elsewhere on a
+        page once a second redaction landed anywhere nearby, and neither
+        the redaction rect's size nor the order/grouping of edits made
+        that go away -- but starting each individual redaction from a
+        freshly-reloaded document did. The old doc is closed to free its
+        resources before returning the new one."""
+        doc.save(_scratch_path, garbage=3, deflate=True)
+        doc.close()
+        new_doc = fitz.open(_scratch_path)
+        return new_doc, new_doc[pno]
 
     total_replaced = 0
     total_deleted = 0
@@ -676,17 +727,14 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     delete_resolved = [parse_delete_phrase(p["phrase"]) for p in delete_phrases]
     near_miss = {}  # rule_idx -> {variant_text: set(page_num, ...)}
 
-    for pno in range(len(doc)):
+    num_pages = len(doc)
+    for pno in range(num_pages):
         page = doc[pno]
         page_num = pno + 1
         spans = get_spans(page)
         lines = build_lines(spans)
         pos_blocks = build_pos_blocks(spans, page.rect.y1)
 
-        redact_pos_nums = []  # POS-block number (or None) for each redact_rects entry,
-                               # used to detect "2+ edits in one shared item
-                               # block" and downgrade those to safe masking
-                               # (see the note further down for why)
         redact_rects = []  # tight rects around the EXACT old text being
                             # removed/replaced -- these get TRUE redaction
         mask_rects = []    # rects covering only REPOSITIONING territory
@@ -775,7 +823,9 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             if not font_covers_text(fontkey, fontfile, combined_text):
                 fontkey, fontfile = _base14_for_style(fontkey), None
             redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
-            redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
+            # No containing span was found for this hit (that's what makes
+            # it "standalone"), so there's no block_idx to key off of --
+            # fall back to the POS-block heuristic instead.
             redact_idx = len(redact_rects) - 1
             # No reflow gap here (no suffix to bridge), but insert_jobs
             # always tracks a mask_rects entry for resolve_line_overlaps to
@@ -799,7 +849,6 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 span = hit["span"]
                 rect = hit["rect"]
                 baseline_y = span["origin"][1]
-                fontkey, fontfile = resolve_font(span["font"], font_files)
                 idx, end = hit["start"], hit["end"]
                 if i + 1 < len(line_hits):
                     suffix_end = line_hits[i + 1]["start"]
@@ -812,17 +861,19 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 combined_text = hit["new"] + suffix
 
                 # The document's embedded font is usually a SUBSET containing
-                # only the glyphs the original file actually used. If the
-                # replacement text needs a character that subset doesn't have
-                # (a digit, an accent, a symbol...), using it anyway would
-                # render as a blank box. Fall back to a full-coverage builtin
-                # font (matching the same bold/italic style) in that case.
-                use_fontkey, use_fontfile = fontkey, fontfile
-                if not font_covers_text(use_fontkey, use_fontfile, combined_text):
-                    print(f"  [warn] page {page_num}: font '{use_fontkey}' is missing a "
-                          f"character needed for '{combined_text}' -- falling back to "
-                          f"a built-in font", file=sys.stderr)
-                    use_fontkey, use_fontfile = _base14_for_style(use_fontkey), None
+                # only the glyphs the original file actually used, and the
+                # SAME font name can have several different subsets across
+                # the document with different glyph coverage (see
+                # extract_all_fonts). Pick whichever actual subset -- or,
+                # failing that, a full-coverage builtin font matching the
+                # same bold/italic style -- genuinely covers everything in
+                # this specific combined_text (the replacement plus
+                # whatever original suffix text is being reflowed with it).
+                use_fontkey, use_fontfile = resolve_font_for_text(span["font"], font_files, combined_text)
+                if use_fontfile is None and not font_covers_text(use_fontkey, use_fontfile, combined_text):
+                    print(f"  [warn] page {page_num}: no available font (embedded or "
+                          f"built-in) covers every character needed for '{combined_text}' "
+                          f"-- some characters may not render correctly", file=sys.stderr)
 
                 # Where to actually draw this hit's text. The FIRST hit on a
                 # line keeps its original position. Every hit after that
@@ -860,7 +911,6 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 # is pure repositioning, not sensitive replaced content, so
                 # it gets the safer non-destructive mask instead.
                 redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
-                redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
                 redact_idx = len(redact_rects) - 1
                 mask_rects.append(fitz.Rect(rect.x1 - pad, rect.y0 - pad, cover_x1 + pad, rect.y1 + pad))
                 mask_idx = len(mask_rects) - 1
@@ -909,7 +959,6 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                     # the whole "U-value (W/m2K)= 1.39" line.
                     lx0, ly0, lx1, ly1 = span.get("line_bbox", span["bbox"])
                     redact_rects.append(fitz.Rect(lx0 - pad, ly0 - pad, lx1 + pad, ly1 + pad))
-                    redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
                     total_deleted += 1
                     modified_pages.add(page_num)
                     continue
@@ -921,12 +970,10 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                         # so no dangling punctuation is left behind.
                         bx0, by0, bx1, by1 = span["bbox"]
                         redact_rects.append(fitz.Rect(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad))
-                        redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
                         total_deleted += 1
                         modified_pages.add(page_num)
                         continue
                 redact_rects.append(fitz.Rect(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad))
-                redact_pos_nums.append(pos_number_for_rect(pos_blocks, redact_rects[-1]))
                 total_deleted += 1
                 modified_pages.add(page_num)
 
@@ -945,7 +992,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
             if ridx is not None:
                 job_by_redact_idx[ridx] = job
 
-        def _draw_insert(job):
+        def _draw_insert(page, job):
             x, y, text, fontkey, fontfile, size = (
                 job["x"], job["y"], job["text"], job["fontkey"], job["fontfile"], job["size"]
             )
@@ -954,31 +1001,6 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                                   fontfile=fontfile, color=(0, 0, 0))
             else:
                 page.insert_text((x, y), text, fontsize=size, fontname=fontkey, color=(0, 0, 0))
-
-        # Some PDF generators draw a whole block of lines for one item
-        # (System:/Colour:/Glass:/U-value/... ) as a SINGLE shared text
-        # object, with each line positioned RELATIVE to the one before it.
-        # Testing showed that whenever true redaction touches that same
-        # shared object TWICE (two separate edits landing in two different
-        # lines of one item), PyMuPDF's reconstruction of the object after
-        # the second redaction corrupts other lines in it -- regardless of
-        # what order the edits are applied in, whether they're batched or
-        # applied one at a time, or whether the earlier edit's replacement
-        # text was already drawn first. That rules out a fix on our end for
-        # the double-redaction case itself, so instead: only use true
-        # redaction where it's PROVEN safe -- exactly one edit in a given
-        # item's (POS-block's) attribute block -- and fall back to the
-        # older, always-safe non-destructive mask for every edit in any
-        # item that has two or more. This keeps true redaction's benefit
-        # (old text genuinely unsearchable) for the common single-edit
-        # case, without risking corrupting an item that needs several.
-        from collections import Counter
-        pos_counts = Counter(redact_pos_nums)
-        risky_indices = {i for i, p in enumerate(redact_pos_nums) if pos_counts[p] >= 2}
-        if risky_indices:
-            print(f"  [note] page {page_num}: {len(risky_indices)} edit(s) share an item "
-                  f"block with another edit -- using the safe non-destructive mask for "
-                  f"those instead of true redaction (see module docstring)", file=sys.stderr)
 
         # The old text actually being replaced/deleted gets TRUE redaction
         # -- removed from the page's content stream, not just painted over
@@ -989,22 +1011,40 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         # it can't affect the window/door diagrams even if a rect happens
         # to sit close to one.
         #
-        # Each hit's redact -> mask -> insert is done as one complete,
-        # finished unit before starting the next hit's, for any hit that
-        # still uses true redaction (see risky_indices above for the ones
-        # that don't).
+        # A full save-to-disk-and-reopen happens after EACH individual
+        # redaction (see _flush_and_reopen below), not just once per page.
+        # Several less drastic approaches were tried first and all failed
+        # empirically against this document: shrinking the redaction rect
+        # to the exact old text, applying each redaction as its own
+        # separate add+apply call instead of batching a page's redactions
+        # together, interleaving each hit's redact-then-insert as one
+        # complete unit before starting the next, and grouping by both
+        # "same item" and PyMuPDF's own internal block_idx (independently
+        # confirmed via a PDF editor's bounding-box view to sometimes NOT
+        # match where the corruption actually spreads -- two edits in two
+        # separate, unrelated boxes still corrupted a third). All of them
+        # left some version of the same failure: an unrelated line's text
+        # vanishing once a second redaction landed anywhere nearby on the
+        # page. None of that was about redaction rect size, order, or
+        # grouping, which points at some form of state PyMuPDF carries
+        # across repeated redactions within one open, in-memory Page/
+        # Document session. Forcing a full save+reload from a clean file
+        # between every single redaction removes that session entirely,
+        # so the next redaction always starts from a freshly-parsed,
+        # fully-committed document with nothing left over from the last
+        # one. This is significantly slower (a full save+reopen per edit,
+        # not per document) -- accepted here because the person using this
+        # tool confirmed old text must be genuinely gone, not just hidden.
         for i, r in enumerate(redact_rects):
-            if i in risky_indices:
-                page.draw_rect(r, color=None, fill=(1, 1, 1), fill_opacity=1, overlay=True)
-            else:
-                page.add_redact_annot(r, fill=(1, 1, 1))
-                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            page.add_redact_annot(r, fill=(1, 1, 1))
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            doc, page = _flush_and_reopen(doc, pno)
             job = job_by_redact_idx.get(i)
             if job is not None:
                 for midx in job["mask_indices"]:
                     page.draw_rect(mask_rects[midx], color=None, fill=(1, 1, 1),
                                     fill_opacity=1, overlay=True)
-                _draw_insert(job)
+                _draw_insert(page, job)
 
         # Any mask rects not tied to a specific redaction (there currently
         # are none by construction, but this keeps behavior correct if that
@@ -1019,7 +1059,7 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         # correct if that ever changes) still gets drawn.
         for job in insert_jobs:
             if job.get("redact_idx") is None:
-                _draw_insert(job)
+                _draw_insert(page, job)
 
         # Automated stand-in for a human eyeballing "the whole page, not
         # just the edited spot": re-check the page we just edited for any
