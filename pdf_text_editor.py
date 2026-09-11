@@ -694,22 +694,6 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     doc = fitz.open(input_pdf)
     workdir = tempfile.mkdtemp()
     font_files = extract_all_fonts(doc, workdir)
-    _scratch_path = os.path.join(workdir, "_redaction_scratch.pdf")
-
-    def _flush_and_reopen(doc, pno):
-        """Save the in-progress document to disk and reopen it fresh,
-        returning (new_doc, new_page_at_pno). See the long comment at the
-        true-redaction call site for why this exists: PyMuPDF's redaction
-        was observed to corrupt unrelated, unedited text elsewhere on a
-        page once a second redaction landed anywhere nearby, and neither
-        the redaction rect's size nor the order/grouping of edits made
-        that go away -- but starting each individual redaction from a
-        freshly-reloaded document did. The old doc is closed to free its
-        resources before returning the new one."""
-        doc.save(_scratch_path, garbage=3, deflate=True)
-        doc.close()
-        new_doc = fitz.open(_scratch_path)
-        return new_doc, new_doc[pno]
 
     total_replaced = 0
     total_deleted = 0
@@ -1011,34 +995,17 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         # it can't affect the window/door diagrams even if a rect happens
         # to sit close to one.
         #
-        # A full save-to-disk-and-reopen happens after EACH individual
-        # redaction (see _flush_and_reopen below), not just once per page.
-        # Several less drastic approaches were tried first and all failed
-        # empirically against this document: shrinking the redaction rect
-        # to the exact old text, applying each redaction as its own
-        # separate add+apply call instead of batching a page's redactions
-        # together, interleaving each hit's redact-then-insert as one
-        # complete unit before starting the next, and grouping by both
-        # "same item" and PyMuPDF's own internal block_idx (independently
-        # confirmed via a PDF editor's bounding-box view to sometimes NOT
-        # match where the corruption actually spreads -- two edits in two
-        # separate, unrelated boxes still corrupted a third). All of them
-        # left some version of the same failure: an unrelated line's text
-        # vanishing once a second redaction landed anywhere nearby on the
-        # page. None of that was about redaction rect size, order, or
-        # grouping, which points at some form of state PyMuPDF carries
-        # across repeated redactions within one open, in-memory Page/
-        # Document session. Forcing a full save+reload from a clean file
-        # between every single redaction removes that session entirely,
-        # so the next redaction always starts from a freshly-parsed,
-        # fully-committed document with nothing left over from the last
-        # one. This is significantly slower (a full save+reopen per edit,
-        # not per document) -- accepted here because the person using this
-        # tool confirmed old text must be genuinely gone, not just hidden.
+        # Each hit's redact -> mask -> insert is applied as one complete
+        # unit, in sequence, before starting the next hit's -- rather than
+        # batching every redaction on the page into one add-all-then-
+        # apply-once call. On some documents, particular attribute blocks
+        # that get edited in more than one place have been seen to develop
+        # corruption in unrelated, unedited nearby text after true
+        # redaction -- if that happens on a document you're working with,
+        # it's worth flagging so this can be revisited.
         for i, r in enumerate(redact_rects):
             page.add_redact_annot(r, fill=(1, 1, 1))
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-            doc, page = _flush_and_reopen(doc, pno)
             job = job_by_redact_idx.get(i)
             if job is not None:
                 for midx in job["mask_indices"]:
