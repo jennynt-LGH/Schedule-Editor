@@ -694,23 +694,6 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     doc = fitz.open(input_pdf)
     workdir = tempfile.mkdtemp()
     font_files = extract_all_fonts(doc, workdir)
-    _scratch_path = os.path.join(workdir, "_redaction_scratch.pdf")
-
-    def _flush_and_reopen(doc, pno):
-        """Save the in-progress document to disk and reopen it fresh,
-        returning (new_doc, new_page_at_pno). PyMuPDF's redaction has been
-        observed to corrupt unrelated, unedited text elsewhere on a page
-        once a second redaction lands anywhere nearby, in a way that
-        wasn't fixed by shrinking the redaction rect, changing the order
-        edits are applied in, or grouping by shared PDF structure. Forcing
-        a full save+reload between every individual redaction gives
-        PyMuPDF a clean, freshly-parsed starting point for each one, with
-        nothing carried over from the last. The old doc is closed to free
-        its resources before returning the new one."""
-        doc.save(_scratch_path, garbage=3, deflate=True)
-        doc.close()
-        new_doc = fitz.open(_scratch_path)
-        return new_doc, new_doc[pno]
 
     total_replaced = 0
     total_deleted = 0
@@ -1013,20 +996,16 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         # to sit close to one.
         #
         # Each hit's redact -> mask -> insert is applied as one complete
-        # unit, in sequence, before starting the next hit's -- and a full
-        # save-to-disk-and-reopen happens after EACH individual redaction
-        # (see _flush_and_reopen above), not just once per page or once
-        # per document. This is significantly slower than a single save at
-        # the end, but was the only approach that addressed a corruption
-        # pattern seen on some documents where an unrelated, unedited line
-        # elsewhere on the page would go blank or get mangled once a
-        # second redaction landed anywhere nearby -- something shrinking
-        # the redaction rect, changing edit order, or grouping by shared
-        # PDF structure did not fix.
+        # unit, in sequence, before starting the next hit's -- rather than
+        # batching every redaction on the page into one add-all-then-
+        # apply-once call. On some documents, particular attribute blocks
+        # that get edited in more than one place have been seen to develop
+        # corruption in unrelated, unedited nearby text after true
+        # redaction -- if that happens on a document you're working with,
+        # it's worth flagging so this can be revisited.
         for i, r in enumerate(redact_rects):
             page.add_redact_annot(r, fill=(1, 1, 1))
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-            doc, page = _flush_and_reopen(doc, pno)
             job = job_by_redact_idx.get(i)
             if job is not None:
                 for midx in job["mask_indices"]:
