@@ -700,6 +700,13 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
     modified_pages = set()
     overlap_warnings = {}  # page_num -> list of warning strings
     not_found_warnings = []  # human-readable strings about rules that matched nothing
+    debug_notes = []  # diagnostic info surfaced to the person running the tool,
+                       # not just to stderr -- font-fallback events, hits with
+                       # no identifiable styling, and pages where several
+                       # edits land close together (which has been the
+                       # single most reliable predictor of a redaction
+                       # disturbing nearby, untouched text on some documents)
+    edits_per_page = {}  # page_num -> count of true-redaction rects on it
 
     # raw_hit_counts: every time a rule's "old" text was found on a page
     # this rule wasn't entirely gated out of (used to tell "genuinely not
@@ -799,6 +806,11 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         for hit in standalone_hits:
             print(f"  [warn] page {page_num}: could not find styling for "
                   f"'{hit['old']}' -- using a fallback font/position", file=sys.stderr)
+            debug_notes.append(
+                f"Page {page_num}: could not find the original styling for "
+                f"'{hit['old']}' -- used a fallback font/position instead of "
+                f"matching the surrounding text exactly."
+            )
             rect = hit["rect"]
             baseline_y = rect.y1 - (rect.y1 - rect.y0) * 0.2
             fontkey, fontfile = "helv", None
@@ -858,6 +870,11 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                     print(f"  [warn] page {page_num}: no available font (embedded or "
                           f"built-in) covers every character needed for '{combined_text}' "
                           f"-- some characters may not render correctly", file=sys.stderr)
+                    debug_notes.append(
+                        f"Page {page_num}: no available font covers every character "
+                        f"needed for '{combined_text}' -- some characters may not "
+                        f"render correctly there."
+                    )
 
                 # Where to actually draw this hit's text. The FIRST hit on a
                 # line keeps its original position. Every hit after that
@@ -964,6 +981,8 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         if not redact_rects and not mask_rects:
             continue
 
+        edits_per_page[page_num] = len(redact_rects)
+
         resolve_line_overlaps(insert_jobs, mask_rects)
 
         # Map each redact_rects index to the insert_job (if any) it belongs
@@ -998,11 +1017,16 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
         # Each hit's redact -> mask -> insert is applied as one complete
         # unit, in sequence, before starting the next hit's -- rather than
         # batching every redaction on the page into one add-all-then-
-        # apply-once call. On some documents, particular attribute blocks
-        # that get edited in more than one place have been seen to develop
-        # corruption in unrelated, unedited nearby text after true
-        # redaction -- if that happens on a document you're working with,
-        # it's worth flagging so this can be revisited.
+        # apply-once call. A save-and-reopen between every individual
+        # redaction was tried at one point to chase a corruption pattern
+        # where an unrelated, unedited line elsewhere on the page would go
+        # blank or get mangled once a second redaction landed anywhere
+        # nearby -- but that turned out to introduce ITS OWN new
+        # corruption (of adjacent lines, even for a single isolated edit)
+        # that the plain sequential approach here does not have. If that
+        # original multi-edit corruption pattern resurfaces on a document,
+        # it's a known open issue -- flag it rather than assuming this
+        # sequence is the cause.
         for i, r in enumerate(redact_rects):
             page.add_redact_annot(r, fill=(1, 1, 1))
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
@@ -1103,6 +1127,23 @@ def process(input_pdf, xlsx_path, output_pdf, preview_dir=None):
                 f"(outside any Only/Except pages) -- double-check the "
                 f"spelling/spacing matches the PDF exactly."
             )
+
+    # Pages with several edits landing on them are the ones where a
+    # redaction disturbing unrelated, nearby text has actually been
+    # observed on some documents -- not a certainty for any given page,
+    # but worth a look rather than only discovering it by eye later.
+    for page_num, count in sorted(edits_per_page.items()):
+        if count >= 2:
+            debug_notes.append(
+                f"Page {page_num}: {count} pieces of text were removed/replaced "
+                f"on this page -- when several edits land close together, "
+                f"it's occasionally caused an unrelated, untouched line nearby "
+                f"to come out blank or garbled on some documents. Worth a look."
+            )
+
+    if debug_notes:
+        not_found_warnings.append("--- Debug info ---")
+        not_found_warnings.extend(debug_notes)
 
     return total_replaced, total_deleted, sorted(modified_pages), overlap_warnings, not_found_warnings
 
